@@ -75,11 +75,3 @@ pub fn health(c: ClientArgs) -> Result<()> {
     Ok(())
 }
 
-pub fn metrics(c: ClientArgs) -> Result<()> {
-    let text = auth(client().get(format!("{}/metrics", c.addr)), &c)
-        .send()?
-        .error_for_status()?
-        .text()?;
-    print!("{text}");
-    Ok(())
-}

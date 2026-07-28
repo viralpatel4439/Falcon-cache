@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::keyspace::Keyspace;
-use falcon_metrics::Metrics;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Composition root: owns one [`Keyspace`] per configured keyspace, built once
@@ -10,7 +10,10 @@ use std::sync::Arc;
 pub struct Node {
     config: Config,
     keyspaces: HashMap<String, Keyspace>,
-    metrics: Arc<Metrics>,
+    /// Whether this node is ready to serve traffic — the state `/readyz`
+    /// reports. Set once startup completes and cleared on shutdown, so an
+    /// orchestrator stops routing to a draining node.
+    ready: AtomicBool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -22,12 +25,48 @@ pub enum NodeError {
 impl Node {
     pub fn build(config: Config) -> Result<Self, NodeError> {
         let mut keyspaces = HashMap::new();
+        let parallelism = crate::resources::available_parallelism();
+        // Auto-sized keyspaces share one budget rather than each claiming a
+        // share of total memory — two keyspaces both auto-sizing would
+        // otherwise commit well over what the machine has.
+        let auto_count = config
+            .keyspaces
+            .iter()
+            .filter(|k| k.cache_capacity_mb.is_none())
+            .count()
+            .max(1);
+
         for ks_cfg in &config.keyspaces {
-            let capacity_bytes = ks_cfg.cache_capacity_mb * 1024 * 1024;
-            let engine = Arc::new(falcon_storage::CacheEngine::new(
-                capacity_bytes,
-                ks_cfg.evict_sample,
+            let resolved = crate::resources::resolve_capacity(ks_cfg.cache_capacity_mb);
+            let capacity_bytes = if ks_cfg.cache_capacity_mb.is_none() {
+                resolved.bytes / auto_count as u64
+            } else {
+                resolved.bytes
+            } as usize;
+
+            // Say what was chosen and why. An auto-sizing cache that keeps that
+            // to itself is an operational trap: after an OOM-kill the first
+            // question is what the cache thought it had.
+            tracing::info!(
+                keyspace = %ks_cfg.name,
+                capacity_mb = capacity_bytes / (1024 * 1024),
+                source = resolved.source.as_str(),
+                cores = parallelism,
+                "cache capacity resolved"
+            );
+
+            let engine = Arc::new(falcon_storage::CacheEngine::with_options(
+                falcon_storage::CacheOptions {
+                    capacity_bytes,
+                    evict_sample: ks_cfg.evict_sample,
+                    parallelism,
+                },
             ));
+            tracing::info!(
+                keyspace = %ks_cfg.name,
+                shards = engine.shard_count(),
+                "cache sharded for this machine"
+            );
             // Reclaims expired entries in the background. Expiry is also
             // enforced on read, so this bounds memory rather than correctness:
             // without it, a key written with a TTL and never read again would
@@ -42,19 +81,12 @@ impl Node {
         Ok(Self {
             config,
             keyspaces,
-            metrics: Arc::new(Metrics::new()),
+            ready: AtomicBool::new(false),
         })
     }
 
     pub fn config(&self) -> &Config {
         &self.config
-    }
-
-    /// The process metrics registry — shared with the HTTP/wire servers so
-    /// every request path records into the same counters/histograms that
-    /// `/metrics` renders.
-    pub fn metrics(&self) -> &Arc<Metrics> {
-        &self.metrics
     }
 
     pub fn keyspace(&self, name: &str) -> Option<&Keyspace> {
@@ -70,10 +102,15 @@ impl Node {
             .ok_or_else(|| NodeError::UnknownKeyspace(name.to_string()))
     }
 
-    /// Mark the node ready (or not) to serve traffic — drives `/readyz` and
-    /// the `falcon_ready` gauge. Called once startup finishes.
+    /// Mark the node ready (or not) to serve traffic — drives `/readyz`.
+    /// Called once startup finishes, and again as shutdown begins.
     pub fn set_ready(&self, ready: bool) {
-        self.metrics.ready.set(if ready { 1 } else { 0 });
+        self.ready.store(ready, Ordering::Relaxed);
+    }
+
+    /// Whether the node is ready to serve traffic.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Relaxed)
     }
 }
 

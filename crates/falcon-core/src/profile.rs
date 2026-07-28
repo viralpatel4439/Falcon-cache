@@ -2,10 +2,9 @@
 //!
 //! Falcon does not read environment variables. A node's entire configuration
 //! lives in a single TOML profile file that is written and edited exclusively
-//! through the CLI (`falcon config set`) or the web UI (`POST /config`). At
-//! startup `falcon serve` loads this file and nothing else; CLI flags to
-//! `serve` may override individual fields for one run, but the durable source
-//! of truth is always the profile.
+//! through the CLI (`falcon config set`). At startup `falcon serve` loads this
+//! file and nothing else; CLI flags to `serve` may override individual fields
+//! for one run, but the durable source of truth is always the profile.
 
 use crate::config::{Config, KeyspaceConfig};
 use serde::{Deserialize, Serialize};
@@ -46,8 +45,12 @@ pub struct ProfileNode {
     pub log_level: String,
     /// Max RAM (MB) the cache may hold. A hard bound: the cache evicts rather
     /// than exceed it.
-    #[serde(default = "default_capacity_mb")]
-    pub capacity_mb: usize,
+    ///
+    /// Unset (the default) means auto-size from the memory this process
+    /// actually has. Skipped when serializing so an unconfigured profile stays
+    /// auto after a save rather than freezing today's detected number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_mb: Option<usize>,
     /// Default TTL in seconds applied to writes that don't carry one.
     /// `0` = entries never expire.
     #[serde(default)]
@@ -73,7 +76,7 @@ impl Default for ProfileNode {
             wire_enabled: false,
             api_key: String::new(),
             log_level: default_log_level(),
-            capacity_mb: default_capacity_mb(),
+            capacity_mb: None,
             default_ttl_secs: 0,
             tls_enabled: false,
             tls_cert: String::new(),
@@ -96,9 +99,6 @@ fn default_wire_bind() -> String {
 }
 fn default_log_level() -> String {
     "info".into()
-}
-fn default_capacity_mb() -> usize {
-    256
 }
 
 /// The full profile: the node's settings. Falcon Cache is a single product,
@@ -172,10 +172,15 @@ impl Profile {
             "api-key" | "api_key" | "auth.api_key" => self.node.api_key = value.to_string(),
             "log-level" | "log_level" => self.node.log_level = value.to_string(),
             "capacity-mb" | "capacity_mb" => {
-                self.node.capacity_mb = value
-                    .trim()
-                    .parse()
-                    .map_err(|_| bad("expected a positive whole number of megabytes"))?
+                // `auto` hands sizing back to detection — without it there
+                // would be no way to undo an explicit value.
+                self.node.capacity_mb = if value.trim().eq_ignore_ascii_case("auto") {
+                    None
+                } else {
+                    Some(value.trim().parse().map_err(|_| {
+                        bad("expected a whole number of megabytes, or 'auto'")
+                    })?)
+                }
             }
             "default-ttl" | "default_ttl_secs" | "default-ttl-secs" => {
                 self.node.default_ttl_secs = value
@@ -203,7 +208,10 @@ impl Profile {
             "wire-enabled" | "wire_enabled" => self.node.wire_enabled.to_string(),
             "api-key" | "api_key" | "auth.api_key" => self.node.api_key.clone(),
             "log-level" | "log_level" => self.node.log_level.clone(),
-            "capacity-mb" | "capacity_mb" => self.node.capacity_mb.to_string(),
+            "capacity-mb" | "capacity_mb" => match self.node.capacity_mb {
+                Some(mb) => mb.to_string(),
+                None => "auto".to_string(),
+            },
             "default-ttl" | "default_ttl_secs" | "default-ttl-secs" => {
                 self.node.default_ttl_secs.to_string()
             }
@@ -303,7 +311,7 @@ mod tests {
         p.set("capacity-mb", "512").unwrap();
         p.set("default-ttl", "60").unwrap();
         let cfg = p.to_config();
-        assert_eq!(cfg.keyspaces[0].cache_capacity_mb, 512);
+        assert_eq!(cfg.keyspaces[0].cache_capacity_mb, Some(512));
         assert_eq!(cfg.keyspaces[0].default_ttl_secs, 60);
     }
 

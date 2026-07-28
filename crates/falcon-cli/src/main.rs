@@ -25,6 +25,5 @@ fn main() -> anyhow::Result<()> {
         Command::Put(a) => client::put(a),
         Command::Del(a) => client::del(a),
         Command::Health(a) => client::health(a),
-        Command::Metrics(a) => client::metrics(a),
     }
 }

@@ -1,7 +1,7 @@
-//! `falcon config` and `falcon status` — the CLI half of the config path.
+//! `falcon config` and `falcon status` — the whole config path.
 //!
 //! Falcon reads no environment variables: every setting lives in the profile
-//! file, written here or by the web UI's `POST /config`.
+//! file, written here.
 
 use crate::cli::ConfigCmd;
 use falcon_core::Profile;

@@ -26,6 +26,9 @@ EXPOSE 8080 6380
 # profile at ~/.falcon or by running
 # `docker run ... falcon-image config set <key> <value>` before `serve`.
 ENV HOME=/home/falcon
+# Capacity is deliberately NOT set: the cache reads the container's own memory
+# limit at startup and sizes itself to it, so `docker run -m 2g` is all the
+# configuration it needs.
 RUN falcon config set http-bind 0.0.0.0:8080 && \
     falcon config set wire-bind 0.0.0.0:6380 && \
     falcon config set wire-enabled true

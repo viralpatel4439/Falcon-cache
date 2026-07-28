@@ -1,4 +1,4 @@
-use crate::rest::{config as config_api, handlers, simple};
+use crate::rest::{handlers, simple};
 use crate::state::AppState;
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
@@ -8,33 +8,21 @@ use axum::routing::get;
 use axum::Router;
 use falcon_core::Node;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Build the router for a node. Convenience overload used by embedders and
-/// tests; production `serve` passes the real profile path.
+/// Build the router for a node: the cache itself plus the health probes.
+///
+/// Configuration is a CLI-only path (`falcon config`, which edits the profile
+/// file in process), so there is no config endpoint here — and no UI to serve.
 pub fn router(node: Arc<Node>) -> Router {
-    router_with_profile(node, falcon_core::default_profile_path())
-}
-
-/// Build the router for a node, persisting UI config edits to `profile_path`.
-pub fn router_with_profile(node: Arc<Node>, profile_path: PathBuf) -> Router {
-    let state = AppState {
-        node,
-        profile_path: Arc::new(profile_path),
-    };
+    let state = AppState { node };
 
     let max_body = state.node.config().storage.max_value_bytes;
 
-    // UI, probes, metrics, health, the config read/write API (the UI's
-    // CLI-equivalent config path), and the cache itself.
     let mut app = Router::new()
-        .route("/", get(handlers::dashboard))
         .route("/healthz", get(handlers::healthz))
         .route("/readyz", get(handlers::readyz))
-        .route("/metrics", get(handlers::metrics))
         .route("/health", get(handlers::health))
-        .route("/config", get(config_api::get_config).post(config_api::set_config))
         // Falcon Cache — POST /cache {key,value,ttl?} · GET/DELETE /cache?key=
         // No scan: a cache is exact-key lookup by design. Entries expire and
         // are evicted, so enumerating one returns a racy, partial snapshot.
@@ -62,26 +50,22 @@ pub fn router_with_profile(node: Arc<Node>, profile_path: PathBuf) -> Router {
 
 /// Rejects requests without the API key. The key may be presented as an
 /// `Authorization: Bearer <key>` header (preferred — not logged) or an
-/// `api_key=<key>` query parameter (fallback for browser clients that cannot
-/// set request headers).
+/// `api_key=<key>` query parameter (fallback for clients that cannot set
+/// request headers).
 ///
 /// The query-param form is only as safe as the transport: use TLS so the URL
 /// isn't sniffable, and note URLs may appear in proxy/access logs.
-/// `/healthz` is always exempt so liveness probes work unauthenticated.
+/// The probes are always exempt so orchestrators work unauthenticated.
 async fn auth_middleware(
     State(state): State<AppState>,
     req: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    // Liveness/readiness/metrics endpoints and the static dashboard page are
-    // always unauthenticated so probes, scrapers, and the UI shell load without
-    // a key. (The dashboard's data calls DO carry the key and are gated.)
-    // GET /config and /health are read-only shell data the UI needs before a
-    // key is entered; POST /config (the config write path) is NOT exempt.
+    // The probes are always unauthenticated so liveness/readiness checks work
+    // without distributing a key to the orchestrator. `/health` carries only
+    // aggregate counters (hit rate, key count, bytes) — never key or value data.
     let path = req.uri().path();
-    let exempt = matches!(path, "/" | "/healthz" | "/readyz" | "/metrics" | "/health")
-        || (path == "/config" && req.method() == axum::http::Method::GET);
-    if exempt {
+    if matches!(path, "/healthz" | "/readyz" | "/health") {
         return Ok(next.run(req).await);
     }
     let token = &state.node.config().auth.api_key;
@@ -120,12 +104,8 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-pub async fn serve(
-    node: Arc<Node>,
-    bind: SocketAddr,
-    profile_path: PathBuf,
-) -> std::io::Result<()> {
-    let app = router_with_profile(node, profile_path);
+pub async fn serve(node: Arc<Node>, bind: SocketAddr) -> std::io::Result<()> {
+    let app = router(node);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "HTTP server listening");
     axum::serve(listener, app).await
@@ -138,7 +118,6 @@ pub async fn serve(
 pub async fn serve_with_shutdown<F>(
     node: Arc<Node>,
     bind: SocketAddr,
-    profile_path: PathBuf,
     shutdown: F,
 ) -> std::io::Result<()>
 where
@@ -147,7 +126,7 @@ where
     // Load TLS once (shared loader) before building the app so a cert error
     // fails fast at startup rather than mid-serve.
     let tls = falcon_core::tls::load_server_config(&node.config().tls)?;
-    let app = router_with_profile(node, profile_path);
+    let app = router(node);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     match tls {
         None => {

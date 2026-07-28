@@ -6,8 +6,8 @@ use clap::{Args, Parser, Subcommand};
 ///   falcon serve                    # run the node (UI at :8080)
 ///   falcon put k v --ttl 60         # from another shell
 ///
-/// Falcon is configured ONLY through this CLI (and the web UI) — it never reads
-/// environment variables. `falcon config set <key> <value>` edits your profile.
+/// Falcon is configured ONLY through this CLI — it never reads environment
+/// variables. `falcon config set <key> <value>` edits your profile.
 #[derive(Parser, Debug)]
 #[command(name = "falcon", version, about, long_about = None)]
 pub struct Cli {
@@ -42,8 +42,6 @@ pub enum Command {
 
     /// Print a node's health JSON.
     Health(ClientArgs),
-    /// Print a node's Prometheus metrics.
-    Metrics(ClientArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -78,7 +76,8 @@ pub struct ServeArgs {
     /// Disable the fast binary protocol server for this run.
     #[arg(long, conflicts_with = "wire_enabled")]
     pub wire_disabled: bool,
-    /// Max RAM (MB) the cache may hold — a hard bound; it evicts rather than exceed it.
+    /// Max RAM (MB) the cache may hold — a hard bound; it evicts rather than
+    /// exceed it. Omit to size from the memory this process actually has.
     #[arg(long)]
     pub capacity_mb: Option<usize>,
     /// Default TTL in seconds for writes that don't specify one (0 = no expiry).

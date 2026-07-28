@@ -10,31 +10,50 @@ that matters — **memory**.
 per shard on every write. Over the bound, the cache samples entries and evicts
 the least recently used rather than growing.
 
-Give the container a ceiling **above** that budget, not equal to it: the process
-also holds connection buffers, the HTTP stack, and allocator slack. If the
-container limit is at or below the cache budget, the kernel OOM-kills the
-process before the cache ever gets to evict — turning a graceful eviction into a
-hard restart. A reasonable starting point is a container limit ~2× the cache
-budget, then tune against your runtime's own memory metric (Falcon does not
-export process RSS itself; use cgroup/container metrics for that).
+**By default you do not set it.** Falcon takes ~70% of the memory the process
+actually has — the cgroup limit when containerized, host RAM otherwise —
+leaving the rest for connection buffers, the HTTP stack, and allocator slack.
+Just give the container the memory you want the cache to use and let it size
+itself; `docker run -m 2g` is the whole configuration.
+
+Check what it picked in the startup log:
+
+```
+cache capacity resolved keyspace=cache capacity_mb=1434 source="cgroup-v2" cores=8
+```
+
+`source` tells you which ceiling it found — `cgroup-v2`/`cgroup-v1` (a container
+limit), `host-total` (no container limit), `explicit` (you set it), or
+`fallback-default` (nothing detectable, 256 MB).
+
+**If you override it**, give the container a ceiling well above the budget, not
+equal to it. A limit at or below the cache budget means the kernel OOM-kills the
+process before the cache ever gets to evict — turning graceful eviction into a
+hard restart. Falcon does not export process RSS; use your runtime's own
+container memory metric for that.
 
 Losing the cache is survivable by design (it starts empty and refills from
 misses), but a restart loop still shows up as a latency cliff at your origin.
 
-## Metrics to watch (`GET /metrics`, Prometheus text)
+## What to watch (`GET /health`)
 
-| Metric | Meaning | Alert |
-|--------|---------|-------|
-| `falcon_ready` | 1 when the node is serving | `== 0` for more than a few seconds after start |
-| `falcon_kv_get_hit_total` / `falcon_kv_get_miss_total` | The hit rate — the cache's entire reason to exist | A falling hit rate usually means the working set outgrew `capacity-mb`, or TTLs are too short |
-| `falcon_kv_get_latency_seconds` | Server-observed read latency | Should stay flat; a RAM lookup does not degrade with dataset size |
-| `falcon_wire_requests_rejected_total` | Wire writes rejected for exceeding `max_value_bytes` | Nonzero = a client is sending oversized values; check the client, not the server |
-| `falcon_wire_idle_timeouts_total` | Connections closed on idle timeout | A steady rise can indicate leaking/half-open clients |
+There is no Prometheus endpoint: a cache's operational story is small enough to
+read straight off the engine, so `/health` returns it as JSON, unauthenticated,
+with no scrape configuration to maintain.
 
-Eviction and hit-rate detail per keyspace is also on `GET /health`
-(`keyspaces[].cache` — hit rate, keys, bytes, evictions, expired), which is what
-the UI at `/` renders. Sustained growth in `evictions` is the signal that the
-working set no longer fits in `capacity-mb`.
+```bash
+curl -s localhost:8080/health | jq '.keyspaces[0].cache'
+```
+
+| Field | Meaning | Watch for |
+|-------|---------|-----------|
+| `hit_rate` | The cache's entire reason to exist | A falling rate usually means the working set outgrew `capacity-mb`, or TTLs are too short |
+| `evictions` | Entries dropped to stay in budget | Sustained growth = the working set no longer fits; raise `capacity-mb` or give the container more memory |
+| `expired` | Entries dropped because their TTL passed | Healthy churn, not a problem in itself |
+| `keys` / `bytes` | Live entries and the RAM they account for | `bytes` plateauing at the budget is eviction working as designed |
+| `ttl_tracked_keys` | Keys carrying an expiry | Zero means the TTL sweep costs nothing at all |
+
+Readiness is a separate signal: `/readyz` returns 503 until startup completes.
 
 ## Probes
 
@@ -64,6 +83,9 @@ so they don't all refill at once.
 These are honest gaps, not guarantees:
 - The **number** of concurrent connections is not capped in-process — bound it
   at the deployment layer (LB / `ulimit -n` / k8s limits).
-- `capacity-mb` bounds the cached entries, not total process RSS;
-  connection buffers and allocator behaviour sit outside it (hence the headroom
-  advice above).
+- `capacity-mb` bounds the cached entries, not total process RSS; connection
+  buffers and allocator behaviour sit outside it. Auto-sizing's headroom is what
+  covers that gap — an explicit `capacity-mb` opts out of it.
+- Memory auto-detection is Linux-only (it reads cgroup files and `/proc`). Other
+  platforms fall back to the 256 MB default, which the startup log reports as
+  `source="fallback-default"`.

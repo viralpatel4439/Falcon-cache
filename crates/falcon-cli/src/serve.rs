@@ -1,10 +1,10 @@
 //! `falcon serve` — run a node from the profile.
 //!
-//! Configuration comes ONLY from the profile file (written by `falcon config`
-//! or the web UI). Falcon reads no environment variables. The `serve` flags may
-//! override individual fields for a single run, but the profile remains the
-//! durable source of truth. If no profile exists yet, the node starts on
-//! defaults rather than refusing to run.
+//! Configuration comes ONLY from the profile file (written by `falcon config`).
+//! Falcon reads no environment variables. The `serve` flags may override
+//! individual fields for a single run, but the profile remains the durable
+//! source of truth. If no profile exists yet, the node starts on defaults —
+//! including a capacity sized to the machine — rather than refusing to run.
 //!
 //! Concurrency is **automatic**. Falcon builds a multi-threaded, work-stealing
 //! Tokio runtime sized to the machine — there is no thread/worker/core knob to
@@ -72,7 +72,7 @@ pub fn run(profile_flag: &Option<String>, args: ServeArgs) -> anyhow::Result<()>
 
     let plan = RuntimePlan::detect();
     let runtime = plan.build()?;
-    runtime.block_on(async move { serve(config, profile_path, plan).await })
+    runtime.block_on(async move { serve(config, plan).await })
 }
 
 /// Serve from a full engine config TOML (the `--config` escape hatch). Used by
@@ -86,8 +86,7 @@ fn run_from_config_file(cfg_path: &str, args: &ServeArgs) -> anyhow::Result<()> 
 
     let plan = RuntimePlan::detect();
     let runtime = plan.build()?;
-    let profile_path = falcon_core::default_profile_path();
-    runtime.block_on(async move { serve(config, profile_path, plan).await })
+    runtime.block_on(async move { serve(config, plan).await })
 }
 
 fn init_tracing(log_level: &str) {
@@ -127,7 +126,7 @@ fn apply_overrides(config: &mut Config, args: &ServeArgs) {
     }
     if let Some(mb) = args.capacity_mb {
         for ks in &mut config.keyspaces {
-            ks.cache_capacity_mb = mb;
+            ks.cache_capacity_mb = Some(mb);
         }
     }
     if let Some(ttl) = args.default_ttl {
@@ -137,12 +136,12 @@ fn apply_overrides(config: &mut Config, args: &ServeArgs) {
     }
 }
 
-async fn serve(config: Config, profile_path: PathBuf, plan: RuntimePlan) -> anyhow::Result<()> {
-    let capacity_mb: usize = config.keyspaces.iter().map(|k| k.cache_capacity_mb).sum();
+async fn serve(config: Config, plan: RuntimePlan) -> anyhow::Result<()> {
+    // The per-keyspace capacity that was actually resolved is logged by
+    // `Node::build`, which is where auto-sizing happens.
     tracing::info!(
         node_id = %config.node.id,
         region = %config.node.region,
-        capacity_mb,
         worker_threads = plan.workers,
         "starting Falcon Cache (auto-sized runtime: one async worker per core)"
     );
@@ -174,12 +173,12 @@ async fn serve(config: Config, profile_path: PathBuf, plan: RuntimePlan) -> anyh
     });
 
     let bind: std::net::SocketAddr = config.http.bind.parse()?;
-    tracing::info!(%bind, "cache UI at http://{bind}/  ·  metrics at /metrics");
+    tracing::info!(%bind, "HTTP API at http://{bind}/cache  ·  health at /healthz");
     let mut http_shutdown = shutdown_tx.subscribe();
     let http_signal = async move {
         let _ = http_shutdown.recv().await;
     };
-    falcon_api::serve_with_shutdown(node.clone(), bind, profile_path, http_signal).await?;
+    falcon_api::serve_with_shutdown(node.clone(), bind, http_signal).await?;
 
     // Nothing to flush: the cache holds no durable state. Draining in-flight
     // requests (above) is the whole of graceful shutdown.

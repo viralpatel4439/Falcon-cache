@@ -110,8 +110,7 @@ where
                     Ok(r) => r?,
                     Err(_) => {
                         // Idle too long: close the connection.
-                        node.metrics().wire_idle_timeouts_total.inc();
-                        return Ok(());
+                            return Ok(());
                     }
                 },
                 None => reader.read_buf(&mut in_buf).await?,
@@ -206,7 +205,6 @@ fn dispatch(node: &Arc<Node>, req: &Request) -> Response {
     let max_value = node.config().storage.max_value_bytes;
     if max_value > 0 && req.op == OP_SET && req.value.len() > max_value
     {
-        node.metrics().wire_requests_rejected_total.inc();
         return Response::BadRequest;
     }
     match req.op {

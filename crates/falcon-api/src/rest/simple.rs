@@ -68,10 +68,6 @@ pub async fn cache_write(
     State(state): State<AppState>,
     Json(body): Json<KvWrite>,
 ) -> Result<Json<Ok>, ApiError> {
-    let m = state.node.metrics();
-    m.http_requests_total.inc();
-    m.kv_put_total.inc();
-    let _timer = m.kv_put_latency.start();
     let ks = state.node.require_keyspace(CACHE_KEYSPACE)?;
     ks.put_with_ttl(body.key.as_bytes(), body.value.as_bytes(), body.ttl);
     Ok(ok())
@@ -82,23 +78,13 @@ pub async fn cache_read(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<ValueResponse>, ApiError> {
-    let m = state.node.metrics();
-    m.http_requests_total.inc();
-    m.kv_get_total.inc();
-    let _timer = m.kv_get_latency.start();
     let key = key_param(&params)?;
     let ks = state.node.require_keyspace(CACHE_KEYSPACE)?;
     match ks.get(key.as_bytes()) {
-        Some(value) => {
-            m.kv_get_hit_total.inc();
-            Ok(Json(ValueResponse {
-                value: String::from_utf8_lossy(&value).to_string(),
-            }))
-        }
-        None => {
-            m.kv_get_miss_total.inc();
-            Err(ApiError::NotFound)
-        }
+        Some(value) => Ok(Json(ValueResponse {
+            value: String::from_utf8_lossy(&value).to_string(),
+        })),
+        None => Err(ApiError::NotFound),
     }
 }
 
@@ -109,9 +95,6 @@ pub async fn cache_delete(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Ok>, ApiError> {
-    let m = state.node.metrics();
-    m.http_requests_total.inc();
-    m.kv_delete_total.inc();
     let key = key_param(&params)?;
     let ks = state.node.require_keyspace(CACHE_KEYSPACE)?;
     ks.delete(key.as_bytes());

@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 falcon-storage = { workspace = true }
-falcon-metrics = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

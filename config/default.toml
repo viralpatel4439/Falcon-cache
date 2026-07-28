@@ -1,11 +1,10 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# NOTE (Falcon config model): Falcon is configured through the CLI and the web
-# UI ONLY. A node's real configuration lives in ~/.falcon/profile.toml, written
-# by `falcon config set <key> <value>` (or the UI's config panel). Falcon does
-# NOT read environment variables.
+# NOTE (Falcon config model): Falcon is configured through the CLI ONLY. A
+# node's real configuration lives in ~/.falcon/profile.toml, written by
+# `falcon config set <key> <value>`. Falcon does NOT read environment variables.
 #
 #   falcon config set region us-east-1
-#   falcon config set capacity-mb 512
+#   falcon config set capacity-mb 512   # or leave it unset to auto-size
 #   falcon serve
 #
 # This file documents the FULL internal engine config for reference. Loading it
@@ -44,7 +43,11 @@ max_value_bytes = 67108864     # 64 MiB anti-OOM cap on a single value/PUT body;
 # both resolve to this name.
 [[keyspace]]
 name = "cache"
-cache_capacity_mb = 256    # HARD memory bound; over it, LRU-samples and evicts
+# HARD memory bound; over it, the cache LRU-samples and evicts. OMIT this key
+# to auto-size from the memory the process actually has (a container limit if
+# there is one, else host RAM) — that is the default and usually the right
+# choice. Setting it here opts out of detection entirely.
+# cache_capacity_mb = 256
 evict_sample = 8           # entries sampled per eviction (approximated LRU)
 default_ttl_secs = 0       # 0 = keys never expire; >0 = auto-expire after N secs
                            # (per-write TTL on PUT overrides this)

@@ -423,7 +423,6 @@ dependencies = [
 name = "falcon-core"
 version = "0.1.0"
 dependencies = [
- "falcon-metrics",
  "falcon-storage",
  "rustls",
  "rustls-pemfile",
@@ -434,10 +433,6 @@ dependencies = [
  "toml",
  "tracing",
 ]
-
-[[package]]
-name = "falcon-metrics"
-version = "0.1.0"
 
 [[package]]
 name = "falcon-storage"

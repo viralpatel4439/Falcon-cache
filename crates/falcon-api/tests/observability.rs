@@ -1,5 +1,5 @@
-//! Integration tests for the production/autoscale surface: /metrics content,
-//! /readyz gating, body-size limits, and that metrics endpoints bypass auth.
+//! Integration tests for the production/autoscale surface: /readyz gating,
+//! body-size limits, and that the probes bypass auth.
 
 use falcon_core::{Config, Node};
 use std::sync::Arc;
@@ -18,34 +18,6 @@ async fn start(config: Config) -> (std::net::SocketAddr, Arc<Node>) {
 
 fn base_config() -> Config {
     Config::default()
-}
-
-#[tokio::test]
-async fn metrics_reflect_operations() {
-    let (addr, _node) = start(base_config()).await;
-    let client = reqwest::Client::new();
-
-    // Do some work.
-    client.post(format!("http://{addr}/cache")).json(&serde_json::json!({"key":"a","value":"1"})).send().await.unwrap();
-    client.post(format!("http://{addr}/cache")).json(&serde_json::json!({"key":"b","value":"2"})).send().await.unwrap();
-    client.get(format!("http://{addr}/cache?key=a")).send().await.unwrap();
-    client.get(format!("http://{addr}/cache?key=missing")).send().await.unwrap();
-
-    let body = client
-        .get(format!("http://{addr}/metrics"))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-
-    assert!(body.contains("falcon_kv_put_total 2"), "puts:\n{body}");
-    assert!(body.contains("falcon_kv_get_total 2"));
-    assert!(body.contains("falcon_kv_get_hit_total 1"));
-    assert!(body.contains("falcon_kv_get_miss_total 1"));
-    assert!(body.contains("# TYPE falcon_kv_put_latency_seconds histogram"));
-    assert!(body.contains("falcon_kv_put_latency_seconds_count 2"));
 }
 
 #[tokio::test]
@@ -93,15 +65,15 @@ async fn body_limit_rejects_oversized_put() {
 }
 
 #[tokio::test]
-async fn metrics_and_readyz_bypass_auth() {
+async fn probes_bypass_auth() {
     let mut config = base_config();
     config.auth.api_key = "s3cret".to_string();
     let (addr, _node) = start(config).await;
     let client = reqwest::Client::new();
 
-    // No token, but these endpoints must still answer (probes/scrapers).
+    // No token, but the probes must still answer (orchestrators hold no key).
     assert_eq!(
-        client.get(format!("http://{addr}/metrics")).send().await.unwrap().status(),
+        client.get(format!("http://{addr}/healthz")).send().await.unwrap().status(),
         200
     );
     // /readyz answers without auth (503 = not-ready, NOT 401 = unauthorized).
@@ -109,7 +81,7 @@ async fn metrics_and_readyz_bypass_auth() {
         client.get(format!("http://{addr}/readyz")).send().await.unwrap().status(),
         503
     );
-    // A real KV route still requires auth.
+    // A real cache route still requires auth.
     assert_eq!(
         client.get(format!("http://{addr}/cache?key=x")).send().await.unwrap().status(),
         401

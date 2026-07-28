@@ -9,6 +9,14 @@ use std::sync::Arc;
 
 const MB: usize = 1024 * 1024;
 
+/// Wall-clock unix millis, matching the engine's own expiry clock.
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
 /// Read a key as an owned `Vec`, so assertions read naturally against literals.
 fn got(cache: &CacheEngine, key: &[u8]) -> Option<Vec<u8>> {
     cache.get_shared(key).map(|v| v.to_vec())
@@ -444,4 +452,105 @@ async fn small_caches_still_evict_by_recency() {
         alive >= 8,
         "a small cache must still honour recency; {alive}/10 of the hot set survived"
     );
+}
+
+/// The per-shard TTL counter must never drift from reality.
+///
+/// It is maintained at five separate mutation sites, and a miss at any one of
+/// them is silent: the sweep would skip a shard that does have expiring
+/// entries, or walk one that doesn't. So check it against a brute-force count
+/// after a mixed workload that exercises every path — insert with and without
+/// a TTL, overwrite in both directions, delete, expire-on-read, and eviction.
+#[tokio::test]
+async fn ttl_counter_matches_reality() {
+    let cache = CacheEngine::new(4 * MB, 8);
+    let far_future = unix_millis() + 600_000;
+
+    for i in 0..400u32 {
+        let k = format!("k{i}");
+        match i % 4 {
+            0 => cache.put(k.as_bytes(), b"v"),                              // no TTL
+            1 => cache.put_with_expiry(k.as_bytes(), b"v", far_future),      // TTL
+            2 => {
+                // TTL, then overwritten as pinned: net zero.
+                cache.put_with_expiry(k.as_bytes(), b"v", far_future);
+                cache.put(k.as_bytes(), b"v2");
+            }
+            _ => {
+                // Pinned, then overwritten with a TTL.
+                cache.put(k.as_bytes(), b"v");
+                cache.put_with_expiry(k.as_bytes(), b"v2", far_future);
+            }
+        }
+    }
+    for i in (0..400u32).step_by(7) {
+        cache.delete(format!("k{i}").as_bytes());
+    }
+    // Already-expired entries, collected on read.
+    for i in 400..430u32 {
+        let k = format!("k{i}");
+        cache.put_with_expiry(k.as_bytes(), b"v", 1);
+        assert!(cache.get_shared(k.as_bytes()).is_none());
+    }
+
+    assert_eq!(
+        cache.tracked_ttl_keys(),
+        cache.count_ttl_keys_by_scan(),
+        "the maintained TTL counter drifted from a brute-force scan"
+    );
+}
+
+/// A cache with no expiring entries must not be swept at all — the sweep is
+/// pure overhead there, and it used to write-lock every shard regardless.
+#[tokio::test]
+async fn sweep_skips_shards_with_no_ttl_entries() {
+    let cache = CacheEngine::new(4 * MB, 8);
+    for i in 0..200u32 {
+        cache.put(format!("k{i}").as_bytes(), b"v");
+    }
+    assert_eq!(cache.tracked_ttl_keys(), 0);
+
+    // Nothing to reclaim, and nothing removed as a side effect.
+    cache.reap_expired();
+    assert_eq!(cache.stats().keys, 200, "a TTL-free cache must not lose keys");
+    assert_eq!(cache.stats().expired, 0);
+}
+
+/// Shard count must answer to cores as well as capacity.
+///
+/// It used to derive from capacity alone, which had two bad consequences: a
+/// small cache became a single shard (one global lock, however many cores), and
+/// a big cache got the same shard count on a 2-core box as on a 128-core one.
+#[test]
+fn shard_count_respects_cores_and_capacity() {
+    // A tiny cache must never collapse to one shard, on any machine.
+    assert!(CacheEngine::new(256 * 1024, 8).shard_count() >= 4);
+    assert!(CacheEngine::new(1024, 8).shard_count() >= 4);
+
+    // More cores must not mean fewer shards, at any capacity.
+    for cap in [256 * 1024, 4 * MB, 64 * MB, 512 * MB] {
+        let mut prev = 0;
+        for cores in [1usize, 2, 4, 8, 16, 64, 128] {
+            let n = CacheEngine::with_options(falcon_storage::CacheOptions {
+                capacity_bytes: cap,
+                evict_sample: 8,
+                parallelism: cores,
+            })
+            .shard_count();
+            assert!(n.is_power_of_two(), "{n} shards is not a power of two");
+            assert!((4..=512).contains(&n), "{n} shards out of range");
+            assert!(n >= prev, "{cores} cores gave fewer shards than fewer cores");
+            prev = n;
+        }
+    }
+
+    // Capacity still caps the count: a 4 MB cache on a huge box must not be
+    // split so finely that each shard has nothing to sample.
+    let small_many_cores = CacheEngine::with_options(falcon_storage::CacheOptions {
+        capacity_bytes: 4 * MB,
+        evict_sample: 8,
+        parallelism: 128,
+    })
+    .shard_count();
+    assert!(small_many_cores <= 16, "4 MB split into {small_many_cores} shards");
 }

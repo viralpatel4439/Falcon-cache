@@ -48,30 +48,11 @@ pub struct HealthResponse {
     pub keyspaces: Vec<KeyspaceHealth>,
 }
 
-/// The embedded UI — one self-contained page, no external assets and no build
-/// step.
-pub async fn dashboard() -> impl IntoResponse {
-    (
-        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        include_str!("../../assets/ui_cache.html"),
-    )
-}
-
-/// Prometheus text-format metrics. Unauthenticated by design (like `/healthz`)
-/// so scrapers/probes work without a key — put the deployment behind network
-/// policy if the numbers are sensitive.
-pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
-    (
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        state.node.metrics().encode_prometheus(),
-    )
-}
-
 /// Readiness probe, distinct from liveness (`/healthz`). Returns 200 only when
 /// the node has finished startup. k8s routes traffic on readiness but only
 /// restarts on liveness.
 pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
-    if state.node.metrics().ready.get() == 1 {
+    if state.node.is_ready() {
         (axum::http::StatusCode::OK, "ready")
     } else {
         (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready")

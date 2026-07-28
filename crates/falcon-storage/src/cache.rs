@@ -76,7 +76,7 @@
 use std::collections::hash_map::Entry as MapEntry;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Upper bound on shard count; the actual count adapts to capacity (see
@@ -92,6 +92,22 @@ const MAX_SHARDS: usize = 512;
 /// recency stops working entirely. Requiring 1 MB per shard keeps every shard
 /// large enough for sampling to mean something.
 const MIN_SHARD_BYTES: usize = 1024 * 1024;
+
+/// Never fewer shards than this, however small the cache.
+///
+/// Capacity alone used to decide the count, so a cache under 2 MB collapsed to
+/// a single shard — one global lock serializing every writer on the machine,
+/// no matter how many cores it had. Four is enough to break that up while
+/// leaving each shard a workable sampling population.
+const MIN_SHARDS: usize = 4;
+
+/// Shards to aim for per logical CPU.
+///
+/// Writers pick a shard by key hash, so collisions are a birthday problem:
+/// several shards per core keeps the chance that two concurrent writers land
+/// on the same one low, without splitting the cache so finely that eviction
+/// sampling suffers.
+const SHARDS_PER_CORE: usize = 4;
 
 /// Per-entry RAM overhead charged against the budget beyond the raw key and
 /// value bytes: the `HashMap` slot, the `Entry` struct, and the two `Arc`
@@ -196,10 +212,45 @@ struct ShardInner {
     map: HashMap<Arc<[u8]>, Entry>,
     /// Resident bytes: `key.len() + value.len() + ENTRY_OVERHEAD` summed over
     /// this shard's entries. This is the number eviction acts on.
+    ///
+    /// Private, and only ever changed through [`ShardInner::set_bytes`], which
+    /// also republishes [`Shard::bytes_hint`]. Keeping the two in step is what
+    /// lets the insert path skip the lock, so they must never be updated
+    /// separately — hence no direct writes to this field.
     bytes: usize,
+    /// Live entries in this shard carrying an expiry (`expires_at != 0`).
+    ///
+    /// Maintained under the same lock as `map`, and mirrored into
+    /// [`Shard::ttl_hint`] so the background sweep can tell — without taking
+    /// any lock — that a shard has nothing to expire. A cache used without
+    /// TTLs (the default) then costs the sweep nothing at all.
+    ttl_keys: usize,
     /// xorshift state for sampling. Per-shard and behind the shard lock, so
     /// sampling needs no shared RNG and no atomics.
     rng: u64,
+}
+
+impl ShardInner {
+    /// Set this shard's resident byte count and republish the lock-free hint.
+    ///
+    /// The single write path for `bytes`, so the hint can never drift from the
+    /// authoritative count: both move together, inside the write lock the
+    /// caller already holds.
+    fn set_bytes(&mut self, bytes: usize, shard: &Shard) {
+        self.bytes = bytes;
+        shard.bytes_hint.store(bytes, Ordering::Release);
+    }
+
+    /// Record that an entry carrying an expiry was added (`+1`) or dropped
+    /// (`-1`), republishing the lock-free hint. Like [`Self::set_bytes`], this
+    /// is the only write path, so the mirror cannot drift.
+    fn add_ttl_keys(&mut self, delta: isize, shard: &Shard) {
+        if delta == 0 {
+            return;
+        }
+        self.ttl_keys = self.ttl_keys.saturating_add_signed(delta);
+        shard.ttl_hint.store(self.ttl_keys, Ordering::Release);
+    }
 }
 
 /// Per-shard counters, padded to their own cacheline.
@@ -233,6 +284,53 @@ struct Shard {
     /// Per-shard RAM budget, enforced locally so the hot path never touches a
     /// process-global counter.
     capacity: usize,
+    /// Lock-free mirror of `inner.bytes`, republished inside the write lock on
+    /// every change.
+    ///
+    /// Eviction reads this *before* taking the lock, so a write to a shard that
+    /// is comfortably under budget — the overwhelmingly common case — pays no
+    /// exclusive lock at all. Previously every insert took the write lock just
+    /// to read `bytes` and discover there was nothing to do, serializing
+    /// writers on the same shard for no reason.
+    ///
+    /// This is a hint, not the authority: `inner.bytes` remains the number
+    /// eviction acts on, and `evict_shard` re-checks it under the lock. A hint
+    /// that lags can only defer an eviction to the next write on that shard,
+    /// never skip enforcement — and `insert` already released the lock before
+    /// calling `evict_shard`, so that window predates this field.
+    bytes_hint: AtomicUsize,
+    /// Lock-free mirror of `inner.ttl_keys`, republished with it.
+    ///
+    /// Lets the sweep skip a shard with no expiring entries without taking the
+    /// write lock — previously it locked and walked every entry of every shard
+    /// on a fixed timer regardless of whether anything could expire.
+    ttl_hint: AtomicUsize,
+}
+
+/// How to size a [`CacheEngine`].
+///
+/// Exists so sizing inputs arrive as plain resolved numbers: the engine reads
+/// no files, no environment, and no config — whoever constructs it decides.
+#[derive(Debug, Clone)]
+pub struct CacheOptions {
+    /// Hard bound on resident memory.
+    pub capacity_bytes: usize,
+    /// Entries sampled per eviction round (approximated LRU).
+    pub evict_sample: usize,
+    /// Logical CPUs to size the shard count for.
+    pub parallelism: usize,
+}
+
+impl Default for CacheOptions {
+    fn default() -> Self {
+        Self {
+            capacity_bytes: 256 * 1024 * 1024,
+            evict_sample: 8,
+            parallelism: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+        }
+    }
 }
 
 /// Pure-RAM cache with a hard memory bound. See the module docs.
@@ -244,8 +342,63 @@ pub struct CacheEngine {
     /// Redis's default is 5; sampling more approaches true LRU at linear cost.
     evict_sample: usize,
     /// Notified on eviction and expiry. `None` until `set_eviction_listener`
-    /// installs one (the keyspace does this when a event bus exists).
+    /// installs one.
     on_removed: std::sync::RwLock<Option<Arc<dyn EvictionListener>>>,
+    /// Where the incremental TTL sweep resumes. Only the maintenance task
+    /// advances it, so contention is nil.
+    sweep_cursor: AtomicUsize,
+}
+
+/// Fraction of the shards one sweep tick visits (`shards / N`).
+const SWEEP_SHARD_DIVISOR: usize = 8;
+
+/// How the background sweep paces itself.
+///
+/// The sweep used to run on a fixed 5-second timer whether or not anything
+/// could expire. Pacing it against what it actually finds means an idle cache
+/// is swept rarely and a cache churning through TTLs is swept promptly, without
+/// either being a configured number.
+struct SweepPacer {
+    delay: std::time::Duration,
+    rng: u64,
+}
+
+impl SweepPacer {
+    const MIN: std::time::Duration = std::time::Duration::from_millis(250);
+    const MAX: std::time::Duration = std::time::Duration::from_secs(30);
+    const START: std::time::Duration = std::time::Duration::from_secs(1);
+
+    fn new() -> Self {
+        Self {
+            delay: Self::START,
+            // Seeded from the clock so co-deployed nodes don't align.
+            rng: now_millis_u64() | 1,
+        }
+    }
+
+    /// Back off when a sweep found nothing, close in when it found something.
+    fn observe(&mut self, reclaimed: usize) {
+        self.delay = if reclaimed == 0 {
+            (self.delay * 2).min(Self::MAX)
+        } else {
+            (self.delay / 2).max(Self::MIN)
+        };
+    }
+
+    /// The next delay, jittered ±25%.
+    ///
+    /// Without jitter every node started by one deployment sweeps in lockstep,
+    /// so their latency blips line up instead of averaging out.
+    fn next_delay(&mut self) -> std::time::Duration {
+        let spread = self.delay.as_millis() as u64 / 2; // full width = 50%
+        let offset = if spread == 0 {
+            0
+        } else {
+            next_rand(&mut self.rng) % spread
+        };
+        // Centre the window on `delay`: [delay - 25%, delay + 25%].
+        self.delay + std::time::Duration::from_millis(offset) - std::time::Duration::from_millis(spread / 2)
+    }
 }
 
 fn now_millis_u64() -> u64 {
@@ -258,10 +411,25 @@ fn now_millis_u64() -> u64 {
 /// How many shards a cache of `capacity_bytes` should use: as many as fit while
 /// keeping each shard at least [`MIN_SHARD_BYTES`], capped at [`MAX_SHARDS`],
 /// rounded down to a power of two so routing is a mask. Always at least 1.
-fn shard_count(capacity_bytes: usize) -> usize {
-    let by_capacity = (capacity_bytes / MIN_SHARD_BYTES).max(1);
-    let n = by_capacity.min(MAX_SHARDS);
-    // Round down to a power of two.
+fn shard_count(capacity_bytes: usize, parallelism: usize) -> usize {
+    // What concurrency wants: enough shards that simultaneous writers rarely
+    // collide. This is the half that used to be missing — the count was derived
+    // from capacity alone, so the same 256 MB cache got the same 256 shards on
+    // a 2-core box and a 128-core one.
+    let by_cores = (parallelism.max(1) * SHARDS_PER_CORE).next_power_of_two();
+    // What eviction quality allows: each shard needs enough bytes to hold a
+    // population worth sampling.
+    let by_capacity = prev_power_of_two((capacity_bytes / MIN_SHARD_BYTES).max(1));
+    // Capacity caps the core-driven number, but never below `MIN_SHARDS` — a
+    // tiny cache still must not become one global lock.
+    by_cores
+        .min(by_capacity.max(MIN_SHARDS))
+        .clamp(MIN_SHARDS, MAX_SHARDS)
+        .next_power_of_two()
+}
+
+/// Largest power of two `<= n`. `n` must be non-zero.
+fn prev_power_of_two(n: usize) -> usize {
     1usize << (usize::BITS - 1 - n.leading_zeros()) as usize
 }
 
@@ -287,26 +455,48 @@ fn next_rand(state: &mut u64) -> u64 {
 }
 
 impl CacheEngine {
-    /// Create a cache bounded to `capacity_bytes` of resident memory.
+    /// Create a cache bounded to `capacity_bytes` of resident memory, sized for
+    /// the current machine's parallelism.
     ///
     /// The bound is hard: it counts value bytes, key bytes, and per-entry
     /// overhead, and the cache sheds entries rather than exceeding it.
-    /// `evict_sample` sets the floor on how much work one CLOCK sweep may do.
+    /// `evict_sample` sets the floor on how much work one eviction round does.
     pub fn new(capacity_bytes: usize, evict_sample: usize) -> Self {
-        // Split the budget evenly across as many shards as it can support
-        // without starving each one of eviction candidates.
-        let n_shards = shard_count(capacity_bytes);
+        Self::with_options(CacheOptions {
+            capacity_bytes,
+            evict_sample,
+            ..CacheOptions::default()
+        })
+    }
+
+    /// Create a cache from a fully-specified set of options.
+    ///
+    /// Prefer this when the caller already knows the machine's parallelism —
+    /// `falcon-core` resolves it once at startup and passes it down, so the
+    /// engine itself never has to probe the environment.
+    pub fn with_options(opts: CacheOptions) -> Self {
+        let CacheOptions {
+            capacity_bytes,
+            evict_sample,
+            parallelism,
+        } = opts;
+        // Split the budget evenly across as many shards as capacity and core
+        // count together justify.
+        let n_shards = shard_count(capacity_bytes, parallelism);
         let per_shard = (capacity_bytes / n_shards).max(1);
         let shards = (0..n_shards)
             .map(|i| Shard {
                 inner: RwLock::new(ShardInner {
                     map: HashMap::new(),
                     bytes: 0,
+                    ttl_keys: 0,
                     // Distinct seeds so shards do not sample in lockstep.
                     rng: 0x9E3779B97F4A7C15u64.wrapping_mul(i as u64 + 1) | 1,
                 }),
                 capacity: per_shard,
                 counters: ShardCounters::default(),
+                bytes_hint: AtomicUsize::new(0),
+                ttl_hint: AtomicUsize::new(0),
             })
             .collect();
         Self {
@@ -314,7 +504,14 @@ impl CacheEngine {
             shards,
             evict_sample: evict_sample.max(1),
             on_removed: std::sync::RwLock::new(None),
+            sweep_cursor: AtomicUsize::new(0),
         }
+    }
+
+    /// How many shards this cache was built with — derived from its capacity
+    /// and the machine's core count, so it is worth reporting at startup.
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
     }
 
     /// Install the listener notified when the cache drops a key by eviction or
@@ -346,10 +543,15 @@ impl CacheEngine {
     /// than correctness.
     pub fn spawn_maintenance(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let engine = Arc::clone(self);
+        // A slice of the shards per tick, so one sweep never walks the whole
+        // cache in a single pass.
+        let per_tick = (engine.shards.len() / SWEEP_SHARD_DIVISOR).max(1);
+        let mut pacer = SweepPacer::new();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                engine.reap_expired();
+                tokio::time::sleep(pacer.next_delay()).await;
+                let reclaimed = engine.reap_some(per_tick);
+                pacer.observe(reclaimed);
             }
         })
     }
@@ -393,9 +595,14 @@ impl CacheEngine {
 
         {
             let mut inner = shard.inner.write().unwrap();
+            // TTL delta for this write: +1 if it gains an expiry, -1 if it
+            // overwrites one with a pinned entry, 0 otherwise. The old entry's
+            // `expires_at` has to be read BEFORE `occ.insert` replaces it.
+            let mut ttl_delta = isize::from(expires_at != 0);
             let freed = match inner.map.entry(key) {
                 MapEntry::Occupied(mut occ) => {
                     let old_ram = entry_ram(occ.key().len(), occ.get().value.len());
+                    ttl_delta -= isize::from(occ.get().expires_at != 0);
                     occ.insert(Entry {
                         value,
                         last_access: AtomicU64::new(now),
@@ -412,7 +619,9 @@ impl CacheEngine {
                     0
                 }
             };
-            inner.bytes = inner.bytes + added - freed;
+            let n = inner.bytes + added - freed;
+            inner.set_bytes(n, shard);
+            inner.add_ttl_keys(ttl_delta, shard);
         }
 
         self.evict_shard(idx);
@@ -462,7 +671,10 @@ impl CacheEngine {
                 Some(entry) if entry.is_expired(now) => {
                     let value_len = entry.value.len();
                     let owned = inner.map.remove_entry(key).map(|(k, _)| k);
-                    inner.bytes = inner.bytes.saturating_sub(entry_ram(key.len(), value_len));
+                    let n = inner.bytes.saturating_sub(entry_ram(key.len(), value_len));
+                    inner.set_bytes(n, shard);
+                    // An expired entry had an expiry by definition.
+                    inner.add_ttl_keys(-1, shard);
                     owned
                 }
                 // Replaced by a live value in the gap: serve it.
@@ -488,13 +700,15 @@ impl CacheEngine {
     /// Remove a key. O(1): there is no eviction ring to keep in step, so a
     /// delete touches nothing but the map and the byte counter.
     fn remove(&self, key: &[u8]) -> bool {
-        let idx = shard_of(key, self.shard_mask);
-        let mut inner = self.shards[idx].inner.write().unwrap();
+        let shard = &self.shards[shard_of(key, self.shard_mask)];
+        let mut inner = shard.inner.write().unwrap();
         match inner.map.remove(key) {
             Some(entry) => {
-                inner.bytes = inner
+                let n = inner
                     .bytes
                     .saturating_sub(entry_ram(key.len(), entry.value.len()));
+                inner.set_bytes(n, shard);
+                inner.add_ttl_keys(-isize::from(entry.expires_at != 0), shard);
                 true
             }
             None => false,
@@ -514,6 +728,13 @@ impl CacheEngine {
     /// are dead weight regardless of the budget.
     fn evict_shard(&self, idx: usize) {
         let shard = &self.shards[idx];
+        // Lock-free rejection of the common case: a shard under budget has no
+        // work to do, and reading the hint costs one relaxed load instead of an
+        // exclusive lock. `inner.bytes` is still the authority — it is
+        // re-checked below once the lock is actually held.
+        if shard.bytes_hint.load(Ordering::Acquire) <= shard.capacity {
+            return;
+        }
         let mut inner = shard.inner.write().unwrap();
         if inner.bytes <= shard.capacity {
             return;
@@ -532,19 +753,36 @@ impl CacheEngine {
         while inner.bytes > shard.capacity && rounds > 0 && !inner.map.is_empty() {
             rounds -= 1;
 
-            // Sample up to `evict_sample` entries and keep the least recently
-            // used. `HashMap` has no positional index, so a sample is taken by
-            // stepping a random distance into the iterator — O(n) in the worst
-            // case, which is why the sample count stays small.
+            // Sample `evict_sample` entries and keep the least recently used.
+            //
+            // `HashMap` has no positional index, so reaching a random entry
+            // means stepping into the iterator. Taking each sample that way
+            // independently cost `evict_sample` separate O(n) walks per round —
+            // on a large shard, millions of iterator steps under the write
+            // lock, and quadratic overall since `rounds` scales with the map.
+            //
+            // Instead: seek once to a random offset and read a contiguous
+            // window of `evict_sample` entries from there. That is one walk per
+            // round rather than `evict_sample` of them. Adjacency costs nothing
+            // in sample quality — bucket order under SipHash is uncorrelated
+            // with insertion time and access pattern, so neighbours are as good
+            // as independent draws for picking a cold victim. (Redis samples
+            // its hash table essentially the same way.)
             let len = inner.map.len();
             let mut victim: Option<(Arc<[u8]>, u64)> = None;
             let mut dead: Option<Arc<[u8]>> = None;
 
-            for _ in 0..self.evict_sample.min(len) {
-                let skip = (next_rand(&mut inner.rng) as usize) % len;
-                let Some((key, entry)) = inner.map.iter().nth(skip) else {
-                    continue;
-                };
+            let window = self.evict_sample.min(len);
+            let start = (next_rand(&mut inner.rng) as usize) % len;
+            // Wrap around the end so a window starting near the tail still sees
+            // `window` entries rather than being truncated.
+            for (key, entry) in inner
+                .map
+                .iter()
+                .skip(start)
+                .chain(inner.map.iter())
+                .take(window)
+            {
                 // An expired entry is strictly better to drop than any live
                 // one: take it immediately and skip the comparison.
                 if entry.expires_at != 0 && now_ms >= entry.expires_at {
@@ -566,9 +804,11 @@ impl CacheEngine {
             };
 
             if let Some(entry) = inner.map.remove(&key) {
-                inner.bytes = inner
+                let n = inner
                     .bytes
                     .saturating_sub(entry_ram(key.len(), entry.value.len()));
+                inner.set_bytes(n, shard);
+                inner.add_ttl_keys(-isize::from(entry.expires_at != 0), shard);
                 match cause {
                     RemovalCause::Expired => expired += 1,
                     RemovalCause::Evicted => evicted += 1,
@@ -587,36 +827,73 @@ impl CacheEngine {
         self.notify_removed(&removed);
     }
 
-    /// Drop every expired entry. Run periodically so dead data never
-    /// accumulates even in a cache that never reaches its memory budget.
+    /// Drop every expired entry, across every shard.
+    ///
+    /// The complete, immediate sweep. The background task uses
+    /// [`Self::reap_some`] instead, which spreads the same work over several
+    /// ticks; this one exists for callers that need the cache fully reaped
+    /// before they look at it.
     pub fn reap_expired(&self) {
-        let now = now_millis_u64();
-        let mut removed: Vec<(Arc<[u8]>, RemovalCause)> = Vec::new();
-        for shard in &self.shards {
-            let mut expired = 0u64;
-            let mut inner = shard.inner.write().unwrap();
-            let dead: Vec<Arc<[u8]>> = inner
-                .map
-                .iter()
-                .filter(|(_, e)| e.is_expired(now))
-                .map(|(k, _)| Arc::clone(k))
-                .collect();
-            for key in dead {
-                if let Some(entry) = inner.map.remove(&key) {
-                    inner.bytes = inner
-                        .bytes
-                        .saturating_sub(entry_ram(key.len(), entry.value.len()));
-                    expired += 1;
-                    removed.push((Arc::clone(&key), RemovalCause::Expired));
-                }
-            }
-            drop(inner);
-            if expired > 0 {
-                shard.counters.expired.fetch_add(expired, Ordering::Relaxed);
-            }
+        let mut removed = Vec::new();
+        for idx in 0..self.shards.len() {
+            self.reap_shard(idx, &mut removed);
         }
         // Outside every shard lock.
         self.notify_removed(&removed);
+    }
+
+    /// Sweep `count` shards starting where the last call stopped, returning how
+    /// many entries were reclaimed.
+    ///
+    /// Sweeping every shard in one pass meant one tick could write-lock the
+    /// whole cache in sequence; spreading it over several ticks bounds how much
+    /// of the cache a single sweep can hold up at once.
+    fn reap_some(&self, count: usize) -> usize {
+        let n = self.shards.len();
+        let start = self.sweep_cursor.fetch_add(count, Ordering::Relaxed);
+        let mut removed = Vec::new();
+        for i in 0..count.min(n) {
+            self.reap_shard((start.wrapping_add(i)) % n, &mut removed);
+        }
+        let reclaimed = removed.len();
+        self.notify_removed(&removed);
+        reclaimed
+    }
+
+    /// Drop the expired entries of one shard, appending them to `removed`.
+    ///
+    /// Returns immediately, without taking the lock, when the shard holds
+    /// nothing that can expire — which is the whole cache in the default
+    /// configuration, where no key carries a TTL.
+    fn reap_shard(&self, idx: usize, removed: &mut Vec<(Arc<[u8]>, RemovalCause)>) {
+        let shard = &self.shards[idx];
+        if shard.ttl_hint.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let now = now_millis_u64();
+        let mut expired = 0u64;
+        let mut inner = shard.inner.write().unwrap();
+        let dead: Vec<Arc<[u8]>> = inner
+            .map
+            .iter()
+            .filter(|(_, e)| e.is_expired(now))
+            .map(|(k, _)| Arc::clone(k))
+            .collect();
+        for key in dead {
+            if let Some(entry) = inner.map.remove(&key) {
+                let n = inner
+                    .bytes
+                    .saturating_sub(entry_ram(key.len(), entry.value.len()));
+                inner.set_bytes(n, shard);
+                inner.add_ttl_keys(-1, shard);
+                expired += 1;
+                removed.push((Arc::clone(&key), RemovalCause::Expired));
+            }
+        }
+        drop(inner);
+        if expired > 0 {
+            shard.counters.expired.fetch_add(expired, Ordering::Relaxed);
+        }
     }
 
     /// Write with an explicit expiry (unix millis; `0` = never). Used by the
@@ -647,7 +924,24 @@ impl CacheEngine {
     }
 
     /// Number of keys whose TTL is being tracked (for `/healthz`).
+    /// Number of keys currently carrying an expiry.
+    ///
+    /// Reads the per-shard counters rather than walking entries, so this is
+    /// O(shards) — it is served on every `/health` request, and previously
+    /// scanned the entire cache to answer.
     pub fn tracked_ttl_keys(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| s.ttl_hint.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Count expiring entries by walking every shard.
+    ///
+    /// The slow, obviously-correct version of [`Self::tracked_ttl_keys`], kept
+    /// so tests can assert the maintained counter never drifts from reality.
+    #[doc(hidden)]
+    pub fn count_ttl_keys_by_scan(&self) -> usize {
         self.shards
             .iter()
             .map(|s| {

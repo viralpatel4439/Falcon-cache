@@ -6,8 +6,13 @@ memory you give it — under pressure it evicts the least recently used entries
 rather than growing.
 
 It runs over two protocols (a pipelined binary TCP protocol and REST) and can
-serve both over **TLS** — all configured through the CLI or the web UI, never
-environment variables.
+serve both over **TLS** — all configured through the CLI, never environment
+variables.
+
+It **sizes itself to the machine it runs on**: given no explicit capacity it
+takes a share of the memory the process actually has (the container limit if
+there is one, else host RAM), shards for the core count it finds, and paces its
+own TTL cleanup against how much there is to clean.
 
 Every crate is `#![forbid(unsafe_code)]` (zero unsafe).
 
@@ -17,11 +22,10 @@ Every crate is `#![forbid(unsafe_code)]` (zero unsafe).
 
 - [Quickstart](#quickstart)
 - [Using the cache](#using-the-cache)
-- [Configuration (CLI / UI only)](#configuration-cli--ui-only)
+- [Configuration (CLI only)](#configuration-cli-only)
 - [Storage: pure RAM](#storage-pure-ram)
 - [Protocols & TLS](#protocols--tls)
-- [Web console](#web-console)
-- [Operations & metrics](#operations--metrics)
+- [Operations](#operations)
 - [Benchmarks](#benchmarks)
 - [Building & testing](#building--testing)
 - [Architecture](#architecture)
@@ -33,8 +37,8 @@ Every crate is `#![forbid(unsafe_code)]` (zero unsafe).
 ```bash
 cargo build --release -p falcon-cli
 
-# Run the node (UI at http://localhost:8080/). No install step, no data
-# directory — it starts on defaults and holds everything in RAM.
+# Run the node. No install step, no data directory, no capacity to pick — it
+# sizes itself to the machine and holds everything in RAM.
 falcon serve
 ```
 
@@ -78,16 +82,16 @@ Full detail — the engine, eviction, and the reasoning behind each choice — i
 
 ---
 
-## Configuration (CLI / UI only)
+## Configuration (CLI only)
 
 Falcon **never reads environment variables**. All settings live in a single
 profile file (`~/.falcon/profile.toml`), written only through:
 
-- the CLI — `falcon config set <key> <value>` / `get` / `list`;
-- the web UI — the config panel (`POST /config`, auth-gated) writes the same file.
+- the CLI — `falcon config set <key> <value>` / `get` / `list`.
 
 ```bash
-falcon config set capacity-mb 512        # the setting that matters most
+falcon config set capacity-mb 512        # pin the bound; omit to auto-size
+falcon config set capacity-mb auto       # hand sizing back to the machine
 falcon config set http-bind 0.0.0.0:9090
 falcon config set api-key s3cret
 falcon config list                       # every key + current value
@@ -109,11 +113,11 @@ chosen worker/blocking counts are logged at startup.
 
 | Key | Example | Controls |
 |-----|---------|----------|
-| `capacity-mb` | `512` | **Hard** RAM bound (default 256). The cache evicts rather than exceed it. |
+| `capacity-mb` | `512` / `auto` | **Hard** RAM bound. `auto` (the default) derives it from detected memory; an explicit value always wins. |
 | `default-ttl` | `300` | Default TTL in seconds for writes that omit one. `0` = never expire. |
 | `node.id` | `us-1` | Node identity (used in logs). |
 | `region` | `us-east-1` | Region label (display). |
-| `http-bind` | `0.0.0.0:8080` | REST / UI address. |
+| `http-bind` | `0.0.0.0:8080` | REST address. |
 | `wire-bind` | `0.0.0.0:6380` | Binary protocol address (if `wire-enabled`). |
 | `wire-enabled` | `true` | Turn the binary protocol on/off. |
 | `api-key` | `s3cret` | Shared secret required on every connection. Empty = auth off. |
@@ -145,7 +149,7 @@ Falcon uses the right protocol for each hop rather than one everywhere:
 | Hop | Protocol | Why |
 |-----|----------|-----|
 | client ↔ service (hot path) | binary TCP, pipelined | lowest latency for small ops (µs-scale); one persistent stream |
-| client ↔ service (REST / UI) | HTTP/1.1 + HTTP/2 | ubiquitous, browser + curl friendly |
+| client ↔ service (REST) | HTTP/1.1 + HTTP/2 | ubiquitous, browser + curl friendly |
 
 Both hops keep **persistent connections**, so this optimizes the per-op path.
 
@@ -175,25 +179,43 @@ The key is compared in constant time; when unset, auth is fully off.
 
 ---
 
-## Web console
+## Self-tuning
 
-Open **`http://localhost:8080/`**. The Cache UI is embedded in the binary (no
-build step, works offline): live hit-rate, keys, memory, evictions, expiries,
-and TTL-tracked keys, plus a config panel that writes the profile. If auth is on, the console prompts for the API key and stores it
-locally.
+Falcon has no thread, core, shard, or sweep-interval knob, and it does not need
+a capacity either. What it can work out from the machine, it does:
+
+| What | How it decides | Override |
+|------|----------------|----------|
+| **Memory** | ~70% of the ceiling this process actually has — a cgroup limit when containerized, else host RAM — leaving headroom for the runtime, buffers, and allocator slack. | `capacity-mb` |
+| **Cores** | One async worker per logical CPU, work-stealing across them. | none — automatic |
+| **Shards** | From core count *and* capacity: enough shards that concurrent writers rarely collide, never so many that a shard has too few entries to pick a good eviction victim. | none — automatic |
+| **Cleaning** | The TTL sweep paces itself: it backs off when it finds nothing to reclaim, closes in when it does, skips shards holding no expiring entries at all, and jitters so co-deployed nodes don't sweep in lockstep. | none — automatic |
+
+The resolved capacity, its source, the core count, and the shard count are all
+logged at startup:
+
+```
+cache capacity resolved keyspace=cache capacity_mb=1434 source="cgroup-v2" cores=8
+cache sharded for this machine keyspace=cache shards=32
+```
+
+Detection failing is not an error — the cache falls back to a 256 MB default and
+says so (`source="fallback-default"`). Setting `capacity-mb` explicitly skips
+detection entirely.
 
 ---
 
-## Operations & metrics
+## Operations
 
 Falcon Cache is built to run as a single autoscalable container. Probes live at
-`/healthz` (liveness) and `/readyz` (readiness); Prometheus metrics at
-`/metrics`.
+`/healthz` (liveness) and `/readyz` (readiness); `/health` returns live cache
+statistics as JSON — hit rate, keys, bytes, evictions, and expiries.
 
 Because the cache is pure RAM, **memory is the one thing to size correctly** —
-give the container a ceiling above `capacity-mb` so the cache evicts
-rather than being OOM-killed. The full runbook, including which metrics to alert
-on, is in **[docs/operations.md](docs/operations.md)**.
+auto-sizing already leaves headroom below the container limit, so the usual
+failure — sizing the cache to the whole container and being OOM-killed before it
+can evict — does not arise unless you override it. The full runbook is in
+**[docs/operations.md](docs/operations.md)**.
 
 ---
 
@@ -235,7 +257,7 @@ latency cliff / queue buildup)**.
 
 ```bash
 cargo build --release                 # the cache node + CLI
-cargo test                            # 65 tests across the workspace
+cargo test                            # 72 tests across the workspace
 cargo clippy --workspace --all-targets
 ```
 

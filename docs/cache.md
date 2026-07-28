@@ -225,12 +225,13 @@ per-write TTL via `--ttl` / `?ttl=` (which overrides the default).
 
 | Key | Effect | Why |
 |-----|--------|-----|
-| `capacity-mb` | **Hard** RAM bound: values + keys + per-entry overhead (default 256 MB) | the cache will not exceed this; set it below your container limit |
+| `capacity-mb` | **Hard** RAM bound: values + keys + per-entry overhead. Unset = auto-size from detected memory | the cache will not exceed this; leaving it unset is usually right |
 | `default-ttl` | default key expiry in seconds (0 = never) | per-write `?ttl=` overrides it |
 | `evict_sample` | entries sampled per eviction (default 8; engine config only) | bigger = closer to true LRU, more work per evict |
 
 Set the first two with `falcon config set <key> <value>`, or override either for
-one run with `falcon serve --capacity-mb N` / `--default-ttl N`.
+one run with `falcon serve --capacity-mb N` / `--default-ttl N`. `falcon config
+set capacity-mb auto` hands sizing back to the machine.
 
 ## 7. Benchmarks
 

@@ -12,15 +12,14 @@ services:
     ports:
       - "8080:8080"   # HTTP / UI
       - "6380:6380"   # binary wire protocol
-    # The cache is pure RAM, so give the container a hard memory ceiling above
-    # the cache's own budget (below) and let the cache evict rather than let
-    # the kernel OOM-kill the process.
+    # The cache is pure RAM and sizes itself to this limit — it takes a share
+    # of it and leaves headroom, so it evicts rather than being OOM-killed.
+    # This one line is the memory configuration.
     mem_limit: 512m
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
         falcon config set node.id cache-1 &&
         falcon config set region us-east-1 &&
-        falcon config set capacity-mb 256 &&
         falcon config set wire-enabled true &&
         falcon serve

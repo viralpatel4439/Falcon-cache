@@ -151,8 +151,14 @@ pub struct KeyspaceConfig {
     /// A **hard** bound on resident memory — values, keys, and per-entry
     /// overhead all count against it, and the cache evicts rather than exceed
     /// it.
-    #[serde(default = "default_cache_capacity_mb")]
-    pub cache_capacity_mb: usize,
+    ///
+    /// `None` means auto-size from the memory this process actually has (a
+    /// container limit if there is one, else host RAM). It has to be an
+    /// `Option` rather than a defaulted number: with a plain default there is
+    /// no way to tell "the operator chose 256" from "the operator said
+    /// nothing", and auto-sizing must never override a deliberate choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_capacity_mb: Option<usize>,
     /// How many entries eviction samples before choosing a victim. Bigger is
     /// closer to true LRU at linear cost; Redis's equivalent default is 5.
     #[serde(default = "default_evict_sample")]
@@ -163,9 +169,6 @@ pub struct KeyspaceConfig {
     pub default_ttl_secs: u64,
 }
 
-fn default_cache_capacity_mb() -> usize {
-    256
-}
 fn default_evict_sample() -> usize {
     8
 }
@@ -177,7 +180,7 @@ impl KeyspaceConfig {
             // `/cache` route and the wire protocol's empty-keyspace default
             // both resolve to.
             name: "cache".to_string(),
-            cache_capacity_mb: default_cache_capacity_mb(),
+            cache_capacity_mb: None,
             evict_sample: default_evict_sample(),
             default_ttl_secs: 0,
         }
@@ -251,13 +254,15 @@ mod cache_config_tests {
             cache_capacity_mb = 128
         "#;
         let cfg: Config = toml::from_str(toml).expect("profile must parse");
-        assert_eq!(cfg.keyspaces[0].cache_capacity_mb, 128);
+        assert_eq!(cfg.keyspaces[0].cache_capacity_mb, Some(128));
     }
 
     #[test]
-    fn defaults_give_one_cache_keyspace() {
+    fn defaults_give_one_auto_sized_cache_keyspace() {
         let cfg = Config::default();
         assert_eq!(cfg.keyspaces.len(), 1);
         assert_eq!(cfg.keyspaces[0].name, "cache");
+        // Unset, so the node sizes it from the memory it actually has.
+        assert_eq!(cfg.keyspaces[0].cache_capacity_mb, None);
     }
 }
