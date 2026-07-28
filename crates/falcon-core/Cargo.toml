@@ -1,0 +1,19 @@
+[package]
+name = "falcon-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+falcon-storage = { workspace = true }
+falcon-metrics = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+toml = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

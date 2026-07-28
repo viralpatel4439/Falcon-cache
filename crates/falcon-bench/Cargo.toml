@@ -1,0 +1,23 @@
+[package]
+name = "falcon-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "falcon-bench"
+path = "src/main.rs"
+
+[dependencies]
+falcon-wire = { workspace = true }
+tokio = { workspace = true }
+reqwest = { version = "0.12", features = ["json"] }
+rand = "0.8"
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tokio-tungstenite = "0.24"
+futures = { workspace = true }
+tempfile = "3"

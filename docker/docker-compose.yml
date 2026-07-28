@@ -1,0 +1,26 @@
+# A single Falcon Cache node.
+#
+# Falcon is configured through its CLI only (no env vars). The image already
+# bakes a profile, so `serve` alone is enough; the explicit `config set` calls
+# below just show where to change the memory bound and node identity. They are
+# idempotent, so restarts are safe.
+services:
+  cache:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8080:8080"   # HTTP / UI
+      - "6380:6380"   # binary wire protocol
+    # The cache is pure RAM, so give the container a hard memory ceiling above
+    # the cache's own budget (below) and let the cache evict rather than let
+    # the kernel OOM-kill the process.
+    mem_limit: 512m
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        falcon config set node.id cache-1 &&
+        falcon config set region us-east-1 &&
+        falcon config set capacity-mb 256 &&
+        falcon config set wire-enabled true &&
+        falcon serve

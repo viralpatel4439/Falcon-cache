@@ -1,0 +1,29 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo.lock is committed for binaries/apps (Falcon ships a binary), so it is
+# intentionally NOT ignored.
+
+# Falcon runtime data (WAL, sled, sharded buckets, messaging logs, streams).
+# The default data_dir is ./data; also ignore anything a test/compose spins up.
+/data/
+/docker/data/
+*.wal
+*.wal.compact
+
+# Environment / secrets
+.env
+*.local.toml
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.idea/
+*.swp
+*.swo
+*~
+# (VS Code settings are left untracked case-by-case; uncomment to ignore all)
+# .vscode/

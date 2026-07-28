@@ -1,0 +1,50 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTE (Falcon config model): Falcon is configured through the CLI and the web
+# UI ONLY. A node's real configuration lives in ~/.falcon/profile.toml, written
+# by `falcon config set <key> <value>` (or the UI's config panel). Falcon does
+# NOT read environment variables.
+#
+#   falcon config set region us-east-1
+#   falcon config set capacity-mb 512
+#   falcon serve
+#
+# This file documents the FULL internal engine config for reference. Loading it
+# directly is the `falcon serve --config <file>` escape hatch, used by the
+# benchmark harness and advanced setups.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[node]
+id = "node-1"
+region = "us-east-1"
+
+# Optional API key. When empty (default) auth is OFF everywhere and costs
+# nothing. When set, EVERY connection must present the key:
+#   HTTP:  Authorization: Bearer <key>   OR   ?api_key=<key>   (/healthz exempt)
+#   wire (binary):  an AUTH frame with the key, first, before any other op
+# NOTE: the ?api_key= query form is only as safe as the transport — use TLS so
+# the URL isn't sniffable, and be aware URLs can appear in proxy/access logs.
+# Prefer the Authorization header where the client can set it.
+[auth]
+api_key = ""                  # e.g. "change-me-to-a-long-random-secret"
+
+[http]
+bind = "0.0.0.0:8080"
+
+[wire]
+enabled = true                # fast binary protocol with pipelining
+bind = "0.0.0.0:6380"
+idle_timeout_secs = 300       # close connections idle this long; 0 = never
+
+# The cache writes NOTHING to disk, so there is no data directory to configure.
+[storage]
+max_value_bytes = 67108864     # 64 MiB anti-OOM cap on a single value/PUT body;
+                               # a larger PUT is rejected with 413. 0 disables.
+
+# The cache keyspace. `/cache` and the wire protocol's empty-keyspace default
+# both resolve to this name.
+[[keyspace]]
+name = "cache"
+cache_capacity_mb = 256    # HARD memory bound; over it, LRU-samples and evicts
+evict_sample = 8           # entries sampled per eviction (approximated LRU)
+default_ttl_secs = 0       # 0 = keys never expire; >0 = auto-expire after N secs
+                           # (per-write TTL on PUT overrides this)

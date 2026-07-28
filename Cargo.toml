@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/falcon-storage",
+    "crates/falcon-api",
+    "crates/falcon-core",
+    "crates/falcon-cli",
+    "crates/falcon-bench",
+    "crates/falcon-wire",
+    "crates/falcon-metrics",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1"
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+toml = "0.8"
+# Transport TLS (rustls: pure-Rust, AES-NI accelerated). Shared across hops.
+# `ring` is the crypto provider; installed once at process start.
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+
+falcon-storage = { path = "crates/falcon-storage" }
+falcon-api = { path = "crates/falcon-api" }
+falcon-core = { path = "crates/falcon-core" }
+falcon-wire = { path = "crates/falcon-wire" }
+falcon-metrics = { path = "crates/falcon-metrics" }
+
+[profile.release]
+lto = true
+codegen-units = 1
