@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned so local builds, CI, and the Docker image agree. Without this, build
+# reproducibility depends on whatever toolchain happens to be installed and the
+# Dockerfile's floating `rust:1-bookworm` tag.
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]

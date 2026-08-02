@@ -5,7 +5,6 @@ members = [
     "crates/falcon-api",
     "crates/falcon-core",
     "crates/falcon-cli",
-    "crates/falcon-bench",
     "crates/falcon-wire",
 ]
 
@@ -22,7 +21,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1"
 anyhow = "1"
-async-trait = "0.1"
 bytes = "1"
 futures = "0.3"
 axum = "0.8"

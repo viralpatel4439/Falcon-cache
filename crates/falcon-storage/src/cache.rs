@@ -164,7 +164,7 @@ impl Entry {
 /// working set does not fit in `capacity_bytes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemovalCause {
-    /// Dropped by the CLOCK sweep to stay within the memory budget.
+    /// Dropped by sampled-LRU eviction to stay within the memory budget.
     Evicted,
     /// Dropped because its TTL had passed.
     Expired,
@@ -183,16 +183,24 @@ pub trait EvictionListener: Send + Sync {
     fn on_removed(&self, key: &[u8], cause: RemovalCause);
 }
 
-/// Observable cache stats, surfaced in `/healthz`.
+/// Observable cache stats, surfaced in `/health`.
 #[derive(Debug, Default, Clone)]
 pub struct CacheStats {
+    /// Reads that found a live entry.
     pub hits: u64,
+    /// Reads that found nothing — never written, or expired or evicted since.
+    /// A read of an expired entry counts here *and* in `expired`: one is the
+    /// caller's view, the other is the reason.
     pub misses: u64,
-    /// Entries dropped by the CLOCK sweep to stay within the memory budget.
+    /// Entries dropped by sampled-LRU eviction to stay within the memory
+    /// budget. A rising count means the working set exceeds `capacity_bytes`.
     pub evictions: u64,
-    /// Entries dropped because their TTL had passed.
+    /// Entries dropped because their TTL had passed, whether noticed on read
+    /// or reclaimed by the background sweep.
     pub expired: u64,
+    /// Live entries across all shards.
     pub keys: u64,
+    /// Bytes charged against the budget: keys, values, and per-entry overhead.
     pub bytes: u64,
 }
 
@@ -397,11 +405,19 @@ impl SweepPacer {
             next_rand(&mut self.rng) % spread
         };
         // Centre the window on `delay`: [delay - 25%, delay + 25%].
-        self.delay + std::time::Duration::from_millis(offset) - std::time::Duration::from_millis(spread / 2)
+        self.delay + std::time::Duration::from_millis(offset)
+            - std::time::Duration::from_millis(spread / 2)
     }
 }
 
-fn now_millis_u64() -> u64 {
+/// Milliseconds since the unix epoch, saturating to `0` if the system clock is
+/// set before 1970.
+///
+/// A pre-epoch clock is a misconfigured machine, not a cache failure: treating
+/// it as "time zero" makes every entry look already-expired, which is a
+/// degraded but safe cache. Panicking here would take down a node on the write
+/// path — this is called on every TTL'd write.
+pub fn now_millis_u64() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -819,7 +835,10 @@ impl CacheEngine {
         drop(inner);
 
         if evicted > 0 {
-            shard.counters.evictions.fetch_add(evicted, Ordering::Relaxed);
+            shard
+                .counters
+                .evictions
+                .fetch_add(evicted, Ordering::Relaxed);
         }
         if expired > 0 {
             shard.counters.expired.fetch_add(expired, Ordering::Relaxed);
@@ -923,8 +942,7 @@ impl CacheEngine {
         self.remove(key)
     }
 
-    /// Number of keys whose TTL is being tracked (for `/healthz`).
-    /// Number of keys currently carrying an expiry.
+    /// Number of keys currently carrying an expiry (reported by `/health`).
     ///
     /// Reads the per-shard counters rather than walking entries, so this is
     /// O(shards) — it is served on every `/health` request, and previously
@@ -957,3 +975,83 @@ impl CacheEngine {
     }
 }
 
+#[cfg(test)]
+mod sweep_pacer_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn backs_off_when_nothing_is_reclaimed() {
+        let mut p = SweepPacer::new();
+        assert_eq!(p.delay, SweepPacer::START);
+        p.observe(0);
+        assert_eq!(p.delay, Duration::from_secs(2));
+        p.observe(0);
+        assert_eq!(p.delay, Duration::from_secs(4));
+    }
+
+    #[test]
+    fn closes_in_when_something_is_reclaimed() {
+        let mut p = SweepPacer::new();
+        p.observe(0);
+        p.observe(0); // 4s
+        p.observe(5);
+        assert_eq!(p.delay, Duration::from_secs(2));
+        p.observe(5);
+        assert_eq!(p.delay, Duration::from_secs(1));
+    }
+
+    /// An idle cache must not back off forever, and a busy one must not spin.
+    #[test]
+    fn delay_stays_within_its_clamps() {
+        let mut p = SweepPacer::new();
+        for _ in 0..50 {
+            p.observe(0);
+        }
+        assert_eq!(p.delay, SweepPacer::MAX, "idle cache must clamp at MAX");
+
+        for _ in 0..50 {
+            p.observe(1);
+        }
+        assert_eq!(p.delay, SweepPacer::MIN, "busy cache must clamp at MIN");
+    }
+
+    /// Jitter must stay inside ±25% — the point is to spread co-deployed nodes
+    /// apart, not to occasionally sweep at a wildly wrong cadence.
+    #[test]
+    fn jitter_stays_within_25_percent_of_the_delay() {
+        let mut p = SweepPacer::new();
+        let base = p.delay;
+        let lo = base - base / 4;
+        let hi = base + base / 4;
+        for _ in 0..1000 {
+            let d = p.next_delay();
+            assert!(d >= lo && d <= hi, "{d:?} outside [{lo:?}, {hi:?}]");
+        }
+    }
+
+    /// Two nodes started at the same moment must not sweep in lockstep; that
+    /// alignment is exactly what the jitter exists to prevent.
+    #[test]
+    fn jitter_actually_varies() {
+        let mut p = SweepPacer::new();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            seen.insert(p.next_delay());
+        }
+        assert!(seen.len() > 1, "next_delay produced a constant");
+    }
+
+    /// `next_delay` must not underflow when the delay is at its minimum.
+    #[test]
+    fn min_delay_does_not_underflow() {
+        let mut p = SweepPacer::new();
+        for _ in 0..50 {
+            p.observe(1);
+        }
+        assert_eq!(p.delay, SweepPacer::MIN);
+        for _ in 0..100 {
+            let _ = p.next_delay(); // must not panic
+        }
+    }
+}

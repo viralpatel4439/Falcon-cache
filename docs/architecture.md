@@ -6,7 +6,7 @@ cache with TTL and a hard memory bound.
 | Doc | What it covers |
 |-----|----------------|
 | **[cache.md](cache.md)** | The cache itself — API surface, the sharded engine, eviction, TTL, and the reasoning behind each choice. **Start here.** |
-| **[operations.md](operations.md)** | Running it: probes, metrics, graceful shutdown, and container sizing. |
+| **[operations.md](operations.md)** | Running it: probes, health statistics, graceful shutdown, and container sizing. |
 
 For the serve model, protocols, TLS, and auth, see the top-level
 [README](../README.md).
@@ -15,7 +15,7 @@ For the serve model, protocols, TLS, and auth, see the top-level
 
 ## The shape of the system
 
-Four crates, each with one job:
+Five crates, each with one job:
 
 ```
   falcon-cli      the `falcon` binary: config, serve, and a client

@@ -1,0 +1,3 @@
+# Defaults are deliberate: the less this file says, the less there is to argue
+# about in review. `cargo fmt --all --check` is enforced in CI.
+edition = "2021"

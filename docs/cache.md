@@ -21,9 +21,9 @@ disappears automatically when it goes stale — no cleanup job, no stale logins.
 ### CLI
 ```bash
 # session token -> the logged-in user, auto-expiring after 1800s (30 min)
-falcon put "session:7f3a9c" '{"user":42,"role":"admin"}' --cache --ttl 1800
-falcon get "session:7f3a9c" --cache          # → {"user":42,"role":"admin"}
-falcon delete "session:7f3a9c" --cache       # e.g. on logout
+falcon put "session:7f3a9c" '{"user":42,"role":"admin"}' --ttl 1800
+falcon get "session:7f3a9c"          # → {"user":42,"role":"admin"}
+falcon del "session:7f3a9c"          # e.g. on logout
 ```
 ### HTTP / REST
 ```bash
@@ -40,8 +40,13 @@ snapshot. If you need to list keys, that belongs in a durable store, not here.
 Other natural fits: a rate-limit counter (`ratelimit:ip:1.2.3.4`, TTL 60),
 a rendered page fragment, or a short-lived API token — anything hot, derived,
 and safe to lose. `value` is a string — the client JSON-stringifies numbers or
-objects into it and parses them back on read. The UI at `/` shows hit-rate,
-hot keys/bytes, evictions, and TTL-tracked keys.
+objects into it and parses them back on read. `GET /health` reports hit rate,
+keys, bytes, evictions, and TTL-tracked keys as JSON.
+
+A value written over the binary protocol may be arbitrary bytes. Reading such a
+value over REST returns it base64-encoded with an explicit
+`"encoding": "base64"` field, rather than silently substituting replacement
+characters for the bytes JSON cannot represent.
 
 ---
 
@@ -56,7 +61,9 @@ every durability mechanism is pure cost.
       │                                │
       ▼                                ▼
   ┌──────────────────────────────────────────────┐
-  │ 64 shards, each an independently locked map  │
+  │ N shards, each an independently locked map   │
+  │   (N is a power of two in 4..=512, derived   │
+  │    from core count and capacity at startup)  │
   │   HashMap<Arc<[u8]>, Entry>                  │
   │   Entry { value, last_access, expires_at }   │
   │   bytes  ← what the budget is enforced on    │
@@ -262,13 +269,10 @@ Sustained mixed load (8 s, 64 connections, depth 16, 50 % writes):
 **2.98 M ops/sec**, p50 329 µs / p99 650 µs per batch — reported **STABLE (no
 latency cliff / queue buildup)**.
 
-Reproduce with:
-
-```bash
-cargo build --release -p falcon-cli -p falcon-bench
-falcon-bench --skip-writes --pipeline-depths 1,16,128   # read path
-falcon-bench --load-test --load-secs 8 --load-conns 64  # sustained load
-```
+These are recorded results rather than a reproducible target: the load-testing
+harness that produced them is no longer part of this repo. What they show is
+structural — pipelining is worth roughly an order of magnitude, and no path
+touches a disk — but measure your own workload before relying on a figure.
 
 ## 8. Single-node by design
 

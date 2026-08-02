@@ -26,10 +26,9 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "key not found".to_string()),
-            ApiError::UnknownKeyspace(name) => (
-                StatusCode::NOT_FOUND,
-                format!("unknown keyspace '{name}'"),
-            ),
+            ApiError::UnknownKeyspace(name) => {
+                (StatusCode::NOT_FOUND, format!("unknown keyspace '{name}'"))
+            }
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
         };
         (status, Json(json!({ "error": message }))).into_response()

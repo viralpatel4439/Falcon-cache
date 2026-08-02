@@ -26,15 +26,27 @@ async fn readyz_reflects_ready_flag() {
     let client = reqwest::Client::new();
 
     // Not ready until set.
-    let resp = client.get(format!("http://{addr}/readyz")).send().await.unwrap();
+    let resp = client
+        .get(format!("http://{addr}/readyz"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 503);
 
     node.set_ready(true);
-    let resp = client.get(format!("http://{addr}/readyz")).send().await.unwrap();
+    let resp = client
+        .get(format!("http://{addr}/readyz"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 
     node.set_ready(false);
-    let resp = client.get(format!("http://{addr}/readyz")).send().await.unwrap();
+    let resp = client
+        .get(format!("http://{addr}/readyz"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 503);
 }
 
@@ -73,18 +85,32 @@ async fn probes_bypass_auth() {
 
     // No token, but the probes must still answer (orchestrators hold no key).
     assert_eq!(
-        client.get(format!("http://{addr}/healthz")).send().await.unwrap().status(),
+        client
+            .get(format!("http://{addr}/healthz"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
         200
     );
     // /readyz answers without auth (503 = not-ready, NOT 401 = unauthorized).
     assert_eq!(
-        client.get(format!("http://{addr}/readyz")).send().await.unwrap().status(),
+        client
+            .get(format!("http://{addr}/readyz"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
         503
     );
     // A real cache route still requires auth.
     assert_eq!(
-        client.get(format!("http://{addr}/cache?key=x")).send().await.unwrap().status(),
+        client
+            .get(format!("http://{addr}/cache?key=x"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
         401
     );
 }
-

@@ -1,6 +1,8 @@
 use bytes::BytesMut;
 use falcon_core::{Config, Node};
-use falcon_wire::{encode_request, OP_DEL, OP_GET, OP_PING, OP_SET, STATUS_NOT_FOUND, STATUS_OK, STATUS_PONG};
+use falcon_wire::{
+    encode_request, OP_DEL, OP_GET, OP_PING, OP_SET, STATUS_NOT_FOUND, STATUS_OK, STATUS_PONG,
+};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -126,7 +128,13 @@ async fn deep_pipeline_preserves_order() {
     const N: usize = 500;
     let mut out = BytesMut::new();
     for i in 0..N {
-        encode_request(&mut out, OP_SET, b"", format!("k{i}").as_bytes(), format!("v{i}").as_bytes());
+        encode_request(
+            &mut out,
+            OP_SET,
+            b"",
+            format!("k{i}").as_bytes(),
+            format!("v{i}").as_bytes(),
+        );
     }
     for i in 0..N {
         encode_request(&mut out, OP_GET, b"", format!("k{i}").as_bytes(), b"");
@@ -140,7 +148,11 @@ async fn deep_pipeline_preserves_order() {
     for i in 0..N {
         let r = read_response(&mut stream).await;
         assert_eq!(r.status, STATUS_OK);
-        assert_eq!(r.value, format!("v{i}").into_bytes(), "GET k{i} returned wrong value");
+        assert_eq!(
+            r.value,
+            format!("v{i}").into_bytes(),
+            "GET k{i} returned wrong value"
+        );
     }
 }
 

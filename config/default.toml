@@ -33,11 +33,20 @@ bind = "0.0.0.0:8080"
 enabled = true                # fast binary protocol with pipelining
 bind = "0.0.0.0:6380"
 idle_timeout_secs = 300       # close connections idle this long; 0 = never
+# Max concurrent wire connections. Each holds a task plus read/write buffers
+# that grow with pipeline depth, so an uncapped accept loop lets client count
+# decide the process's memory ceiling. At the cap, new clients wait in the
+# kernel accept queue rather than being rejected. 0 disables the cap.
+max_connections = 4096
 
 # The cache writes NOTHING to disk, so there is no data directory to configure.
 [storage]
 max_value_bytes = 67108864     # 64 MiB anti-OOM cap on a single value/PUT body;
                                # a larger PUT is rejected with 413. 0 disables.
+# Max accepted key size. Keys live for the entry's whole lifetime and are
+# charged against the budget exactly like values, so an uncapped key is the same
+# memory risk as an uncapped value. 0 disables the cap.
+max_key_bytes = 65536          # 64 KiB
 
 # The cache keyspace. `/cache` and the wire protocol's empty-keyspace default
 # both resolve to this name.

@@ -41,6 +41,11 @@ There is no Prometheus endpoint: a cache's operational story is small enough to
 read straight off the engine, so `/health` returns it as JSON, unauthenticated,
 with no scrape configuration to maintain.
 
+For per-request detail — which requests 404'd or 401'd, and how long they took —
+set `falcon config set log-level debug`. Request spans are emitted at DEBUG
+rather than INFO because at millions of ops/sec a line per request costs more
+than the request does.
+
 ```bash
 curl -s localhost:8080/health | jq '.keyspaces[0].cache'
 ```
@@ -71,6 +76,23 @@ SIGTERM drains in-flight requests and stops accepting new connections. There is
 **no final flush to wait on** — the cache holds nothing durable — so shutdown is
 as fast as the in-flight requests allow.
 
+## Connection limits
+
+The wire protocol caps concurrent connections at `wire.max_connections`
+(default 4096, `0` disables). Each connection holds a task plus read and write
+buffers that grow with pipeline depth, so without a cap the number of clients —
+not the configured capacity — would decide the process's memory ceiling.
+
+At the cap the server simply stops accepting until a live connection finishes;
+pending clients wait in the kernel's accept queue rather than being handed a
+socket the server has no budget to serve. If you see clients blocking on
+connect, either raise the cap or look for connection leaks in the client —
+Falcon is designed around a small number of long-lived connections, not one per
+request.
+
+Idle connections are closed after `wire.idle_timeout_secs` (default 300), which
+bounds half-open and slowloris clients.
+
 ## Restart behaviour
 
 A restarted cache starts **empty**, by design. Expect a miss spike and a
@@ -81,8 +103,6 @@ so they don't all refill at once.
 ## Not covered (known limits)
 
 These are honest gaps, not guarantees:
-- The **number** of concurrent connections is not capped in-process — bound it
-  at the deployment layer (LB / `ulimit -n` / k8s limits).
 - `capacity-mb` bounds the cached entries, not total process RSS; connection
   buffers and allocator behaviour sit outside it. Auto-sizing's headroom is what
   covers that gap — an explicit `capacity-mb` opts out of it.

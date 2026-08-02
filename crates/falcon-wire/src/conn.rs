@@ -3,7 +3,7 @@
 use crate::codec::{decode_one, DecodeError};
 use crate::protocol::{Request, Response, OP_AUTH, OP_DEL, OP_GET, OP_PING, OP_SET};
 use bytes::BytesMut;
-use falcon_core::Node;
+use falcon_core::{constant_time_eq, Node};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -41,15 +41,45 @@ const MIN_READ_SPACE: usize = 32 * 1024;
 /// request targets it.
 const DEFAULT_KEYSPACE: &str = "cache";
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+/// Upper bound on requests dispatched from one read before replies are written.
+///
+/// The drain loop pulls every complete frame out of the read buffer, so without
+/// a cap a client that pipelines aggressively decides how large the request
+/// `Vec` grows. Stopping at a fixed depth bounds that: the undecoded bytes stay
+/// in `in_buf` and are picked up on the next iteration, so this changes batch
+/// granularity, never semantics. Set well above the deepest useful pipeline
+/// (the bench tops out at 128).
+const MAX_BATCH: usize = 1024;
+
+/// Operator-configured size limits, resolved once per connection.
+///
+/// `0` disables a limit, matching the config semantics.
+#[derive(Clone, Copy)]
+struct SizeLimits {
+    max_value: usize,
+    max_key: usize,
+}
+
+impl SizeLimits {
+    fn from_node(node: &Node) -> Self {
+        let storage = &node.config().storage;
+        Self {
+            max_value: storage.max_value_bytes,
+            max_key: storage.max_key_bytes,
+        }
     }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+
+    /// Whether this request exceeds a configured bound.
+    ///
+    /// Keys are checked on every op — a GET or DEL for an oversized key is
+    /// just as malformed as a SET, and rejecting it early keeps the engine
+    /// from hashing megabytes. Values are only meaningful on SET.
+    fn rejects(&self, req: &Request) -> bool {
+        if self.max_key > 0 && req.key.len() > self.max_key {
+            return true;
+        }
+        self.max_value > 0 && req.op == OP_SET && req.value.len() > self.max_value
     }
-    diff == 0
 }
 
 /// Handle one connection over any byte stream — a plain `TcpStream` or a
@@ -75,6 +105,10 @@ where
     let auth = &node.config().auth;
     let mut authed = !auth.is_enabled();
 
+    // Size caps are fixed for the process lifetime, so resolve them once per
+    // connection rather than re-reading config for every request in a batch.
+    let limits = SizeLimits::from_node(&node);
+
     // Idle timeout: close a connection that sends nothing for this long, so an
     // idle/half-open/slowloris client can't hold a task + socket forever. `0`
     // disables it.
@@ -84,9 +118,11 @@ where
     };
 
     loop {
-        // 1. Drain every fully-buffered request into a pipeline batch.
+        // 1. Drain fully-buffered requests into a pipeline batch, up to
+        //    `MAX_BATCH`. Anything beyond that stays in `in_buf` for the next
+        //    iteration.
         let mut batch: Vec<Request> = Vec::new();
-        loop {
+        while batch.len() < MAX_BATCH {
             match decode_one(&mut in_buf) {
                 Ok(Some(req)) => batch.push(req),
                 Ok(None) => break, // need more bytes
@@ -110,7 +146,7 @@ where
                     Ok(r) => r?,
                     Err(_) => {
                         // Idle too long: close the connection.
-                            return Ok(());
+                        return Ok(());
                     }
                 },
                 None => reader.read_buf(&mut in_buf).await?,
@@ -132,7 +168,6 @@ where
         // below. Almost every real batch uses one keyspace throughout.
         let mut cached_ks: Option<&falcon_core::Keyspace> = None;
         let mut cached_ks_bytes: Option<bytes::Bytes> = None;
-        let max_value = node.config().storage.max_value_bytes;
         for req in batch.iter() {
             // Auth gate: before authentication, only an AUTH frame is honored.
             if req.op == OP_AUTH {
@@ -152,12 +187,10 @@ where
             // once per run of identical keyspace bytes rather than per request,
             // and an engine that can answer without awaiting (the cache) does
             // so directly — no future is built or polled for it.
-            // The value-size cap is an anti-OOM guard, so it must hold on this
-            // path exactly as it does in `dispatch` — otherwise a client could
-            // pipeline oversized values straight past it.
-            if matches!(req.op, OP_GET | OP_SET | OP_DEL)
-                && !(max_value > 0 && req.op == OP_SET && req.value.len() > max_value)
-            {
+            // The size caps are anti-OOM guards, so they must hold on this
+            // path exactly as they do in `dispatch` — otherwise a client could
+            // pipeline oversized keys or values straight past them.
+            if matches!(req.op, OP_GET | OP_SET | OP_DEL) && !limits.rejects(req) {
                 if cached_ks_bytes.as_deref() != Some(&req.keyspace[..]) {
                     cached_ks = name_str(&req.keyspace, DEFAULT_KEYSPACE)
                         .and_then(|name| node.keyspace(name));
@@ -169,7 +202,7 @@ where
                 }
                 continue;
             }
-            dispatch(&node, req).encode(&mut out_buf);
+            dispatch(&node, req, limits).encode(&mut out_buf);
         }
         // 4. One write syscall per batch, straight from the response buffer —
         //    no intermediate copy.
@@ -197,14 +230,12 @@ fn name_str<'a>(bytes: &'a [u8], default: &'a str) -> Option<&'a str> {
     }
 }
 
-fn dispatch(node: &Arc<Node>, req: &Request) -> Response {
-    // Enforce the configured value-size cap on every write-bearing op, matching
-    // the REST layer's DefaultBodyLimit. The wire codec's MAX_FRAME is a hard
-    // ceiling independent of config; this honors a LOWER operator-set limit so a
-    // client can't pipeline oversized values straight into the write path.
-    let max_value = node.config().storage.max_value_bytes;
-    if max_value > 0 && req.op == OP_SET && req.value.len() > max_value
-    {
+fn dispatch(node: &Arc<Node>, req: &Request, limits: SizeLimits) -> Response {
+    // Enforce the configured size caps, matching the REST layer's
+    // DefaultBodyLimit. The wire codec's MAX_FRAME is a hard ceiling
+    // independent of config; this honors a LOWER operator-set limit so a client
+    // can't pipeline oversized keys or values straight into the write path.
+    if limits.rejects(req) {
         return Response::BadRequest;
     }
     match req.op {
@@ -251,4 +282,3 @@ fn dispatch_kv_on(ks: &falcon_core::Keyspace, req: &Request) -> Response {
         _ => Response::BadRequest,
     }
 }
-

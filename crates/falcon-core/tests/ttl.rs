@@ -47,7 +47,11 @@ async fn expired_entries_stop_being_tracked() {
 
     assert_eq!(value(ks.get(b"a")), None);
     assert_eq!(value(ks.get(b"b")), None);
-    assert_eq!(ks.tracked_ttl_keys(), 0, "expired entries stop being tracked");
+    assert_eq!(
+        ks.tracked_ttl_keys(),
+        0,
+        "expired entries stop being tracked"
+    );
 }
 
 #[tokio::test]
@@ -96,7 +100,11 @@ async fn default_ttl_applies_to_writes_that_omit_one() {
 
     ks.put(b"inherits", b"v");
     ks.put_with_ttl(b"pinned", b"v", Some(0));
-    assert_eq!(ks.tracked_ttl_keys(), 1, "only the inheriting key has an expiry");
+    assert_eq!(
+        ks.tracked_ttl_keys(),
+        1,
+        "only the inheriting key has an expiry"
+    );
 
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert_eq!(value(ks.get(b"inherits")), None, "default TTL must apply");

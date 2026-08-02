@@ -34,23 +34,61 @@ Every crate is `#![forbid(unsafe_code)]` (zero unsafe).
 
 ## Quickstart
 
-```bash
-cargo build --release -p falcon-cli
+Pick whichever you prefer — both give you a node listening on `:8080` (REST)
+and `:6380` (binary protocol). There is no data directory, no capacity to pick,
+and no config file to write: the node sizes itself to the machine.
 
-# Run the node. No install step, no data directory, no capacity to pick — it
-# sizes itself to the machine and holds everything in RAM.
+### Option A — Docker (nothing to install but Docker)
+
+```bash
+docker build -f docker/Dockerfile -t falcon-cache .
+docker run -d --name falcon-cache -m 512m -p 8080:8080 -p 6380:6380 falcon-cache
+```
+
+`-m 512m` **is** the memory configuration — the cache reads the container's own
+limit at startup and sizes itself under it. Or use the shortcut:
+
+```bash
+make docker-run     # build, run, and wait until it answers /healthz
+```
+
+### Option B — Install the binary
+
+Needs a Rust toolchain ([rustup.rs](https://rustup.rs)); the exact compiler
+version is pinned by the repo, so you don't have to pick one.
+
+```bash
+make install        # cargo install --path crates/falcon-cli
 falcon serve
 ```
 
+If `falcon: command not found`, add cargo's bin directory to your `PATH`:
+
 ```bash
-# In another shell, use the same binary as a client. A login session that
-# expires on its own after 30 minutes — the classic use for a cache with TTL:
+export PATH="$HOME/.cargo/bin:$PATH"
+```
+
+To build without installing, use `make build` and run
+`./target/release/falcon serve`.
+
+### Use it
+
+```bash
+# The same binary is the client. A login session that expires on its own after
+# 30 minutes — the classic use for a cache with TTL:
 falcon put "session:7f3a9c" '{"user":42,"role":"admin"}' --ttl 1800
 falcon get "session:7f3a9c"      # → {"user":42,"role":"admin"}
 falcon del "session:7f3a9c"      # e.g. on logout
 falcon status                    # current config
 falcon health
 ```
+
+The client subcommands read the node's address and API key from your profile, so
+`falcon config set http-bind 0.0.0.0:9090` moves the client along with the
+server. Point them elsewhere with `--addr http://host:port` (and `--api-key`)
+when talking to a remote node.
+
+Run `make` on its own to see every available task.
 
 ```bash
 # …or over plain HTTP — one product = one URL, key+value in a JSON body:
@@ -105,9 +143,10 @@ If no profile exists yet, the node simply starts on defaults.
 
 **Concurrency is automatic — there is no thread/worker/core knob.** On start,
 Falcon sizes a multi-threaded, work-stealing runtime to the machine: one async
-worker per logical CPU plus a separate elastic blocking pool. The scheduler
-work-steals to balance load, so the runtime adapts to traffic on its own. The
-chosen worker/blocking counts are logged at startup.
+worker per logical CPU. The scheduler work-steals to balance load, so the
+runtime adapts to traffic on its own. The chosen worker count is logged at
+startup. Every operation is served from RAM with no I/O to await, so nothing is
+ever offloaded to a blocking pool.
 
 ### Config reference
 
@@ -125,8 +164,13 @@ chosen worker/blocking counts are logged at startup.
 | `tls-enabled` | `true` | In-process TLS on **both** hops. Off by default. |
 | `tls-cert` / `tls-key` | `/path/*.pem` | PEM cert chain + private key. |
 
-Engine-internal tuning (`evict_sample`, `max_value_bytes`) is documented in
-[`config/default.toml`](config/default.toml).
+Engine-internal tuning (`evict_sample`, `max_value_bytes`, `max_key_bytes`,
+`max_connections`, `idle_timeout_secs`) is documented in
+[`config/default.toml`](config/default.toml) and reachable via
+`falcon serve --config <file>`.
+
+The profile file is written `0600` in a `0700` directory, since it holds the
+API key in plaintext.
 
 ---
 
@@ -221,20 +265,15 @@ can evict — does not arise unless you override it. The full runbook is in
 
 ## Benchmarks
 
-Run with the bundled load tester:
-
-```bash
-cargo build --release -p falcon-cli -p falcon-bench
-
-falcon-bench --skip-writes --pipeline-depths 1,16,128   # read path
-falcon-bench --load-test --load-secs 8 --load-conns 64  # sustained load
-```
-
 **Measured on an Apple M5 (10 cores, 16 GB, macOS 26), `--release` + LTO.**
-These are real numbers from this repo — reproduce them with the commands above.
 Throughput figures are **concurrent** (many connections at once), so they
 reflect real capacity, not single-thread. Both reads and writes are served
 entirely from RAM; there is no disk I/O on either path.
+
+> These are recorded results, not a reproducible target: the load-testing
+> harness that produced them is no longer part of this repo. Treat them as an
+> indication of the design's shape — pipelining dominates, and neither path
+> touches a disk — and measure your own workload before relying on a number.
 
 | Path | Throughput | p50 | p99 |
 |------|-----------:|----:|----:|
@@ -256,10 +295,22 @@ latency cliff / queue buildup)**.
 ## Building & testing
 
 ```bash
-cargo build --release                 # the cache node + CLI
-cargo test                            # 72 tests across the workspace
-cargo clippy --workspace --all-targets
+make build     # release binary at target/release/falcon
+make test      # the whole workspace
+make check     # fmt + clippy (-D warnings) + test — run this before committing
 ```
+
+Or with cargo directly:
+
+```bash
+cargo build --release
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+```
+
+The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml), so
+local builds, CI, and the Docker image all compile with the same compiler.
 
 ---
 

@@ -21,9 +21,9 @@ fn main() -> anyhow::Result<()> {
         Command::Serve(args) => serve::run(&profile, args),
 
         // Client subcommands: talk to a running node over HTTP.
-        Command::Get(a) => client::get(a),
-        Command::Put(a) => client::put(a),
-        Command::Del(a) => client::del(a),
-        Command::Health(a) => client::health(a),
+        Command::Get(a) => client::get(&profile, a),
+        Command::Put(a) => client::put(&profile, a),
+        Command::Del(a) => client::del(&profile, a),
+        Command::Health(a) => client::health(&profile, a),
     }
 }

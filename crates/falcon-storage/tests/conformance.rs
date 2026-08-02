@@ -44,5 +44,8 @@ fn basic_read_write_delete_contract() {
         "deleting a live key reports it was present"
     );
     assert!(engine.get_shared(b"foo").is_none());
-    assert!(!engine.delete(b"foo"), "deleting an absent key reports false");
+    assert!(
+        !engine.delete(b"foo"),
+        "deleting an absent key reports false"
+    );
 }

@@ -33,6 +33,10 @@ pub const STATUS_OK: u8 = 0x00;
 pub const STATUS_NOT_FOUND: u8 = 0x01;
 pub const STATUS_BAD_REQUEST: u8 = 0x02;
 pub const STATUS_UNKNOWN_KEYSPACE: u8 = 0x03;
+/// Reserved, never emitted. A pure-RAM cache has no I/O to fail: there is no
+/// disk write to error, no replica to lose, and no downstream to time out.
+/// The number stays claimed so a future status cannot reuse `0x04` and change
+/// what an existing client decodes.
 pub const STATUS_SERVER_ERROR: u8 = 0x04;
 pub const STATUS_PONG: u8 = 0x05;
 pub const STATUS_UNAUTHORIZED: u8 = 0x0a; // auth required or token mismatch
@@ -54,21 +58,29 @@ pub struct Request {
 /// A response to encode back to the client.
 #[derive(Debug, Clone)]
 pub enum Response {
-    Ok,                    // SET/DEL success
-    Value(Vec<u8>),        // GET hit
+    /// SET/DEL success.
+    Ok,
     /// GET hit whose bytes the engine already owns behind an `Arc`.
     ///
     /// Encoding writes the slice straight into the connection's output buffer,
     /// so the value is copied exactly once — into the socket buffer — instead of
     /// twice (engine → `Vec`, `Vec` → output buffer). At a pipeline depth of
     /// 128 that removes 128 allocations and 128 copies per batch.
+    ///
+    /// There is deliberately no owned `Value(Vec<u8>)` counterpart: every hit
+    /// comes from the engine already behind an `Arc`, so an owned variant could
+    /// only ever add a copy.
     ValueShared(std::sync::Arc<[u8]>),
-    NotFound,              // GET miss
-    Pong,                  //
-    BadRequest,            //
-    UnknownKeyspace,       //
-    ServerError,           //
-    Unauthorized,          // auth required / token mismatch
+    /// GET miss.
+    NotFound,
+    /// PING reply.
+    Pong,
+    /// Malformed request, or one exceeding a configured size cap.
+    BadRequest,
+    /// The named keyspace does not exist on this node.
+    UnknownKeyspace,
+    /// Auth required, or token mismatch.
+    Unauthorized,
 }
 
 /// Appends a request frame to `out` (little-endian). Public so clients
@@ -93,11 +105,6 @@ impl Response {
                 out.put_u8(STATUS_OK);
                 out.put_u32_le(0);
             }
-            Response::Value(v) => {
-                out.put_u8(STATUS_OK);
-                out.put_u32_le(v.len() as u32);
-                out.put_slice(v);
-            }
             Response::ValueShared(v) => {
                 out.put_u8(STATUS_OK);
                 out.put_u32_le(v.len() as u32);
@@ -119,10 +126,6 @@ impl Response {
                 out.put_u8(STATUS_UNKNOWN_KEYSPACE);
                 out.put_u32_le(0);
             }
-            Response::ServerError => {
-                out.put_u8(STATUS_SERVER_ERROR);
-                out.put_u32_le(0);
-            }
             Response::Unauthorized => {
                 out.put_u8(STATUS_UNAUTHORIZED);
                 out.put_u32_le(0);
@@ -138,8 +141,13 @@ mod tests {
     #[test]
     fn status_codes_are_distinct() {
         let all = [
-            STATUS_OK, STATUS_NOT_FOUND, STATUS_BAD_REQUEST, STATUS_UNKNOWN_KEYSPACE,
-            STATUS_SERVER_ERROR, STATUS_PONG, STATUS_UNAUTHORIZED,
+            STATUS_OK,
+            STATUS_NOT_FOUND,
+            STATUS_BAD_REQUEST,
+            STATUS_UNKNOWN_KEYSPACE,
+            STATUS_SERVER_ERROR,
+            STATUS_PONG,
+            STATUS_UNAUTHORIZED,
         ];
         let mut sorted = all.to_vec();
         sorted.sort_unstable();
@@ -158,7 +166,7 @@ mod tests {
         assert_eq!(out.len(), 5);
 
         let mut out = BytesMut::new();
-        Response::Value(b"hello".to_vec()).encode(&mut out);
+        Response::ValueShared(std::sync::Arc::from(&b"hello"[..])).encode(&mut out);
         assert_eq!(out[0], STATUS_OK);
         assert_eq!(u32::from_le_bytes([out[1], out[2], out[3], out[4]]), 5);
         assert_eq!(&out[5..], b"hello");

@@ -42,8 +42,25 @@ pub fn router(node: Arc<Node>) -> Router {
     // Only attach the auth layer when a token is configured — zero cost
     // (not even a layer in the stack) when auth is off.
     if state.node.config().auth.is_enabled() {
-        app = app.layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        app = app.layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
     }
+
+    // Per-request spans. Without this a request that 404s or 401s produces no
+    // log line at all, so "the client says it's broken" has nothing on the
+    // server side to correlate against.
+    //
+    // Emitted at DEBUG, not INFO: at millions of ops/sec a line per request
+    // would cost more than the request. `falcon config set log-level debug`
+    // turns it on when a specific problem needs it. This is deliberately not a
+    // metrics system — see docs/operations.md.
+    app = app.layer(
+        tower_http::trace::TraceLayer::new_for_http()
+            .make_span_with(tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::DEBUG))
+            .on_response(tower_http::trace::DefaultOnResponse::new().level(tracing::Level::DEBUG)),
+    );
 
     app.with_state(state)
 }
@@ -77,31 +94,24 @@ async fn auth_middleware(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
 
-    // 2. ?api_key=<key> query param (browser fallback).
+    // 2. ?api_key=<key> query param (browser fallback). Percent-decoded, since
+    //    a key containing `+`, `/`, or `=` arrives escaped and would otherwise
+    //    never match the configured token.
     let query_key = req.uri().query().and_then(|q| {
         q.split('&')
             .find_map(|kv| kv.strip_prefix("api_key="))
+            .map(falcon_core::percent_decode)
     });
 
-    let presented = header_key.or(query_key).unwrap_or("");
-    if constant_time_eq(presented.as_bytes(), token.as_bytes()) {
+    let presented = header_key
+        .map(str::to_owned)
+        .or(query_key)
+        .unwrap_or_default();
+    if falcon_core::constant_time_eq(presented.as_bytes(), token.as_bytes()) {
         Ok(next.run(req).await)
     } else {
         Err(StatusCode::UNAUTHORIZED)
     }
-}
-
-/// Length-independent-ish constant-time comparison to avoid leaking the
-/// token via response timing.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 pub async fn serve(node: Arc<Node>, bind: SocketAddr) -> std::io::Result<()> {

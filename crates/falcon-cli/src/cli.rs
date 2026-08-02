@@ -95,10 +95,11 @@ pub struct ServeArgs {
 /// sensible default), never environment variables.
 #[derive(Args, Debug, Clone)]
 pub struct ClientArgs {
-    /// Base URL of the node's HTTP API.
-    #[arg(long, default_value = "http://127.0.0.1:8080")]
-    pub addr: String,
-    /// API key, if the node has auth enabled.
+    /// Base URL of the node's HTTP API. Defaults to the address in your
+    /// profile, so `falcon config set http-bind` moves the client with it.
+    #[arg(long)]
+    pub addr: Option<String>,
+    /// API key, if the node has auth enabled. Defaults to the profile's key.
     #[arg(long)]
     pub api_key: Option<String>,
 }

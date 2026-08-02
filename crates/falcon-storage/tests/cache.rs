@@ -107,7 +107,10 @@ async fn oversized_values_do_not_breach_the_bound() {
         cache.put(format!("big:{i}").as_bytes(), &value);
     }
     let bytes = cache.stats().bytes as usize;
-    assert!(bytes <= capacity, "resident bytes {bytes} exceeded {capacity}");
+    assert!(
+        bytes <= capacity,
+        "resident bytes {bytes} exceeded {capacity}"
+    );
 }
 
 #[tokio::test]
@@ -302,7 +305,8 @@ async fn evictions_and_expiries_are_reported() {
     cache.reap_expired();
     let seen = recorder.seen.lock().unwrap();
     assert!(
-        seen.iter().any(|(k, c)| k == b"doomed" && *c == RemovalCause::Expired),
+        seen.iter()
+            .any(|(k, c)| k == b"doomed" && *c == RemovalCause::Expired),
         "expiry must be reported as Expired"
     );
 }
@@ -331,7 +335,10 @@ async fn repeated_insert_delete_does_not_grow() {
     }
     let stats = cache.stats();
     assert_eq!(stats.keys, 0);
-    assert_eq!(stats.bytes, 0, "insert/delete churn must leave nothing behind");
+    assert_eq!(
+        stats.bytes, 0,
+        "insert/delete churn must leave nothing behind"
+    );
 }
 
 /// Expiry is enforced on read, not only by the background sweep: a stale
@@ -360,7 +367,10 @@ async fn shared_read_does_not_copy() {
     let a = cache.get_shared(b"k").unwrap();
     let b = cache.get_shared(b"k").unwrap();
     // Both handles address the same allocation the engine holds.
-    assert!(Arc::ptr_eq(&a, &b), "reads must share one allocation, not copy");
+    assert!(
+        Arc::ptr_eq(&a, &b),
+        "reads must share one allocation, not copy"
+    );
     assert_eq!(&*a, b"value");
 }
 
@@ -373,7 +383,14 @@ async fn shared_read_does_not_copy() {
 /// The threshold is deliberately loose — this asserts the shape (more cores do
 /// not make it slower), not a throughput number that would be machine-specific
 /// and flaky.
+///
+/// `#[ignore]` because it measures wall-clock throughput: run alongside the
+/// rest of the suite, on a machine doing anything else, it fails for reasons
+/// that have nothing to do with the cache. Run it deliberately, on an otherwise
+/// idle machine, with `make test-timing` (or `cargo test --release -- --ignored
+/// --test-threads=1`).
 #[test]
+#[ignore = "timing-sensitive; run deliberately via `make test-timing`"]
 fn concurrent_reads_scale_with_threads() {
     use std::time::Instant;
 
@@ -469,8 +486,8 @@ async fn ttl_counter_matches_reality() {
     for i in 0..400u32 {
         let k = format!("k{i}");
         match i % 4 {
-            0 => cache.put(k.as_bytes(), b"v"),                              // no TTL
-            1 => cache.put_with_expiry(k.as_bytes(), b"v", far_future),      // TTL
+            0 => cache.put(k.as_bytes(), b"v"), // no TTL
+            1 => cache.put_with_expiry(k.as_bytes(), b"v", far_future), // TTL
             2 => {
                 // TTL, then overwritten as pinned: net zero.
                 cache.put_with_expiry(k.as_bytes(), b"v", far_future);
@@ -512,7 +529,11 @@ async fn sweep_skips_shards_with_no_ttl_entries() {
 
     // Nothing to reclaim, and nothing removed as a side effect.
     cache.reap_expired();
-    assert_eq!(cache.stats().keys, 200, "a TTL-free cache must not lose keys");
+    assert_eq!(
+        cache.stats().keys,
+        200,
+        "a TTL-free cache must not lose keys"
+    );
     assert_eq!(cache.stats().expired, 0);
 }
 
@@ -539,7 +560,10 @@ fn shard_count_respects_cores_and_capacity() {
             .shard_count();
             assert!(n.is_power_of_two(), "{n} shards is not a power of two");
             assert!((4..=512).contains(&n), "{n} shards out of range");
-            assert!(n >= prev, "{cores} cores gave fewer shards than fewer cores");
+            assert!(
+                n >= prev,
+                "{cores} cores gave fewer shards than fewer cores"
+            );
             prev = n;
         }
     }
@@ -552,5 +576,8 @@ fn shard_count_respects_cores_and_capacity() {
         parallelism: 128,
     })
     .shard_count();
-    assert!(small_many_cores <= 16, "4 MB split into {small_many_cores} shards");
+    assert!(
+        small_many_cores <= 16,
+        "4 MB split into {small_many_cores} shards"
+    );
 }

@@ -246,7 +246,10 @@ mod tests {
     fn auto_capacity_takes_the_fraction_on_large_limits() {
         // With plenty spare, the 70% share is what binds.
         assert_eq!(auto_capacity_bytes(limit(4 * GB)), Some(4 * GB / 100 * 70));
-        assert_eq!(auto_capacity_bytes(limit(64 * GB)), Some(64 * GB / 100 * 70));
+        assert_eq!(
+            auto_capacity_bytes(limit(64 * GB)),
+            Some(64 * GB / 100 * 70)
+        );
     }
 
     #[test]

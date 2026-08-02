@@ -74,7 +74,7 @@ impl Node {
             engine.spawn_maintenance();
             keyspaces.insert(
                 ks_cfg.name.clone(),
-                Keyspace::new(ks_cfg.name.clone(), engine, ks_cfg.default_ttl_secs),
+                Keyspace::new(engine, ks_cfg.default_ttl_secs),
             );
         }
 

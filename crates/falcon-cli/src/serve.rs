@@ -27,11 +27,13 @@ struct RuntimePlan {
 
 impl RuntimePlan {
     /// Derive the plan purely from the hardware — no user input.
+    ///
+    /// Uses the same core-count probe the cache engine is sized from, so the
+    /// worker count and the shard count cannot disagree about the machine.
     fn detect() -> Self {
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        Self { workers }
+        Self {
+            workers: falcon_core::available_parallelism(),
+        }
     }
 
     /// Build the multi-threaded runtime this plan describes.
@@ -185,4 +187,142 @@ async fn serve(config: Config, plan: RuntimePlan) -> anyhow::Result<()> {
     node.set_ready(false);
     tracing::info!("drained in-flight requests; exiting cleanly");
     Ok(())
+}
+
+#[cfg(test)]
+mod override_tests {
+    use super::*;
+
+    /// A `serve` invocation with no flags — the baseline every test varies from.
+    fn no_flags() -> ServeArgs {
+        ServeArgs {
+            config: None,
+            http_bind: None,
+            wire_bind: None,
+            wire_enabled: false,
+            wire_disabled: false,
+            capacity_mb: None,
+            default_ttl: None,
+            node_id: None,
+            region: None,
+            log_level: "info".to_string(),
+        }
+    }
+
+    #[test]
+    fn absent_flags_leave_the_profile_untouched() {
+        // The common case: `falcon serve` with no flags must not silently
+        // rewrite settings the operator configured in the profile.
+        let mut config = Config::default();
+        config.node.id = "from-profile".into();
+        config.http.bind = "10.0.0.1:9999".into();
+        let before = config.clone();
+
+        apply_overrides(&mut config, &no_flags());
+
+        assert_eq!(config.node.id, before.node.id);
+        assert_eq!(config.http.bind, before.http.bind);
+        assert_eq!(config.wire.enabled, before.wire.enabled);
+    }
+
+    #[test]
+    fn flags_override_profile_values() {
+        let mut config = Config::default();
+        config.node.id = "from-profile".into();
+
+        let args = ServeArgs {
+            http_bind: Some("127.0.0.1:1111".into()),
+            wire_bind: Some("127.0.0.1:2222".into()),
+            node_id: Some("from-flag".into()),
+            region: Some("eu-west-1".into()),
+            ..no_flags()
+        };
+        apply_overrides(&mut config, &args);
+
+        assert_eq!(config.http.bind, "127.0.0.1:1111");
+        assert_eq!(config.wire.bind, "127.0.0.1:2222");
+        assert_eq!(config.node.id, "from-flag");
+        assert_eq!(config.node.region, "eu-west-1");
+    }
+
+    #[test]
+    fn wire_can_be_enabled_and_disabled_for_one_run() {
+        let mut config = Config::default();
+        config.wire.enabled = false;
+        apply_overrides(
+            &mut config,
+            &ServeArgs {
+                wire_enabled: true,
+                ..no_flags()
+            },
+        );
+        assert!(config.wire.enabled);
+
+        let mut config = Config::default();
+        config.wire.enabled = true;
+        apply_overrides(
+            &mut config,
+            &ServeArgs {
+                wire_disabled: true,
+                ..no_flags()
+            },
+        );
+        assert!(!config.wire.enabled);
+    }
+
+    /// `--capacity-mb` and `--default-ttl` are node-level flags that fan out to
+    /// every keyspace, so a config declaring several must have them all set.
+    #[test]
+    fn capacity_and_ttl_apply_to_every_keyspace() {
+        let mut config = Config::default();
+        config.keyspaces.push(falcon_core::KeyspaceConfig {
+            name: "second".into(),
+            cache_capacity_mb: None,
+            evict_sample: 8,
+            default_ttl_secs: 0,
+        });
+
+        apply_overrides(
+            &mut config,
+            &ServeArgs {
+                capacity_mb: Some(512),
+                default_ttl: Some(300),
+                ..no_flags()
+            },
+        );
+
+        assert!(!config.keyspaces.is_empty());
+        for ks in &config.keyspaces {
+            assert_eq!(ks.cache_capacity_mb, Some(512), "{}", ks.name);
+            assert_eq!(ks.default_ttl_secs, 300, "{}", ks.name);
+        }
+    }
+
+    /// Omitting `--capacity-mb` must leave `None` in place: `None` is what
+    /// selects auto-sizing, and overwriting it with a number would silently
+    /// opt the node out of detection.
+    #[test]
+    fn omitting_capacity_preserves_auto_sizing() {
+        let mut config = Config::default();
+        for ks in &mut config.keyspaces {
+            ks.cache_capacity_mb = None;
+        }
+
+        apply_overrides(&mut config, &no_flags());
+
+        for ks in &config.keyspaces {
+            assert_eq!(
+                ks.cache_capacity_mb, None,
+                "auto-sizing must survive a flagless serve"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_plan_allocates_at_least_one_worker() {
+        // Sized from the machine, so assert the invariant rather than a number.
+        let plan = RuntimePlan::detect();
+        assert!(plan.workers >= 1);
+        assert_eq!(plan.workers, falcon_core::available_parallelism());
+    }
 }

@@ -17,10 +17,14 @@ impl Default for NodeConfig {
     }
 }
 
-fn default_node_id() -> String {
+// These are `pub(crate)` because `profile.rs` shares them. The profile and the
+// runtime config describe the same node, so a node that starts on defaults and
+// one configured from a freshly-written profile must agree — two independent
+// copies of these literals could drift apart silently.
+pub(crate) fn default_node_id() -> String {
     "node-1".to_string()
 }
-fn default_region() -> String {
+pub(crate) fn default_region() -> String {
     "local".to_string()
 }
 
@@ -64,7 +68,7 @@ impl Default for HttpConfig {
     }
 }
 
-fn default_http_bind() -> String {
+pub(crate) fn default_http_bind() -> String {
     "0.0.0.0:8080".to_string()
 }
 
@@ -83,11 +87,6 @@ impl AuthConfig {
     pub fn is_enabled(&self) -> bool {
         !self.api_key.is_empty()
     }
-
-    /// The configured key (empty = auth off).
-    pub fn key(&self) -> &str {
-        &self.api_key
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -101,6 +100,12 @@ pub struct WireConfig {
     /// `0` disables the timeout (connections may idle indefinitely).
     #[serde(default = "default_wire_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
+
+    /// Max concurrent wire connections. Each connection owns a task and read
+    /// and write buffers that grow with pipeline depth, so an unbounded accept
+    /// loop turns connection count into unbounded memory. `0` disables the cap.
+    #[serde(default = "default_wire_max_connections")]
+    pub max_connections: usize,
 }
 
 impl Default for WireConfig {
@@ -109,6 +114,7 @@ impl Default for WireConfig {
             enabled: default_true(),
             bind: default_wire_bind(),
             idle_timeout_secs: default_wire_idle_timeout_secs(),
+            max_connections: default_wire_max_connections(),
         }
     }
 }
@@ -116,11 +122,17 @@ impl Default for WireConfig {
 fn default_true() -> bool {
     true
 }
-fn default_wire_bind() -> String {
+pub(crate) fn default_wire_bind() -> String {
     "0.0.0.0:6380".to_string()
 }
 fn default_wire_idle_timeout_secs() -> u64 {
     300 // 5 minutes: generous for persistent clients, bounds truly-idle sockets
+}
+fn default_wire_max_connections() -> usize {
+    // Well above what a normal client fleet opens (clients hold one persistent
+    // connection each), low enough that the per-connection buffers cannot
+    // dwarf the cache itself.
+    4096
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -129,18 +141,33 @@ pub struct StorageConfig {
     /// this is rejected with 413. Default 64 MiB; set 0 to disable the cap.
     #[serde(default = "default_max_value_bytes")]
     pub max_value_bytes: usize,
+
+    /// Max accepted key size in bytes. Keys are held for the entry's whole
+    /// lifetime and are charged against the cache budget exactly like values,
+    /// so an uncapped key is the same memory risk as an uncapped value — the
+    /// wire codec's 64 MiB frame ceiling alone would admit a 64 MiB key
+    /// carrying a one-byte value. Default 64 KiB; set 0 to disable the cap.
+    #[serde(default = "default_max_key_bytes")]
+    pub max_key_bytes: usize,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             max_value_bytes: default_max_value_bytes(),
+            max_key_bytes: default_max_key_bytes(),
         }
     }
 }
 
 fn default_max_value_bytes() -> usize {
     64 * 1024 * 1024
+}
+
+fn default_max_key_bytes() -> usize {
+    // Far above any sane cache key (`session:<uuid>` is ~45 bytes) while still
+    // rejecting the pathological cases outright.
+    64 * 1024
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -15,4 +15,5 @@ rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 
 [dev-dependencies]
+rcgen = { version = "0.14.8", default-features = false, features = ["pem", "ring"] }
 tempfile = "3"

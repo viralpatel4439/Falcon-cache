@@ -26,6 +26,39 @@ fn home_dir() -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
+/// Restrict the profile file to owner-only (`0600`).
+///
+/// The profile stores `api_key` in plaintext. `std::fs::write` creates with
+/// `0644` by default, which would publish the shared secret to every local
+/// user on the machine.
+#[cfg(unix)]
+fn restrict_file(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+/// Restrict the profile directory to owner-only (`0700`).
+///
+/// A `0600` file inside a world-readable directory still leaks its name and
+/// lets another user replace it, so the directory is tightened too.
+#[cfg(unix)]
+fn restrict_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Windows has no mode bits; ACL inheritance from the user profile directory
+/// is the platform-appropriate protection, so this is a no-op there.
+#[cfg(not(unix))]
+fn restrict_file(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// The node identity + network settings a profile carries.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProfileNode {
@@ -85,18 +118,10 @@ impl Default for ProfileNode {
     }
 }
 
-fn default_node_id() -> String {
-    "node-1".into()
-}
-fn default_region() -> String {
-    "local".into()
-}
-fn default_http_bind() -> String {
-    "0.0.0.0:8080".into()
-}
-fn default_wire_bind() -> String {
-    "0.0.0.0:6380".into()
-}
+// Re-exported from `config` rather than redefined: the profile and the runtime
+// config must describe the same node, and duplicated literals drift.
+use crate::config::{default_http_bind, default_node_id, default_region, default_wire_bind};
+
 fn default_log_level() -> String {
     "info".into()
 }
@@ -146,12 +171,18 @@ impl Profile {
     }
 
     /// Persist the profile, creating the parent directory if needed.
+    ///
+    /// The file holds the API key in plaintext, so on Unix it is written
+    /// `0600` and its directory `0700` — the default `0644` would leave the
+    /// shared secret readable by every local user.
     pub fn save(&self, path: &Path) -> Result<(), ProfileError> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
+            restrict_dir(dir)?;
         }
         let s = toml::to_string_pretty(self)?;
         std::fs::write(path, s)?;
+        restrict_file(path)?;
         Ok(())
     }
 
@@ -167,7 +198,8 @@ impl Profile {
             "http-bind" | "http_bind" | "node.http_bind" => self.node.http_bind = value.to_string(),
             "wire-bind" | "wire_bind" | "node.wire_bind" => self.node.wire_bind = value.to_string(),
             "wire-enabled" | "wire_enabled" => {
-                self.node.wire_enabled = parse_bool(value).map_err(|_| bad("expected true/false"))?
+                self.node.wire_enabled =
+                    parse_bool(value).map_err(|_| bad("expected true/false"))?
             }
             "api-key" | "api_key" | "auth.api_key" => self.node.api_key = value.to_string(),
             "log-level" | "log_level" => self.node.log_level = value.to_string(),
@@ -177,9 +209,12 @@ impl Profile {
                 self.node.capacity_mb = if value.trim().eq_ignore_ascii_case("auto") {
                     None
                 } else {
-                    Some(value.trim().parse().map_err(|_| {
-                        bad("expected a whole number of megabytes, or 'auto'")
-                    })?)
+                    Some(
+                        value
+                            .trim()
+                            .parse()
+                            .map_err(|_| bad("expected a whole number of megabytes, or 'auto'"))?,
+                    )
                 }
             }
             "default-ttl" | "default_ttl_secs" | "default-ttl-secs" => {

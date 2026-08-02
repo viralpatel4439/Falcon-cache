@@ -1,4 +1,4 @@
-use falcon_storage::{CacheEngine, CacheStats};
+use falcon_storage::{now_millis_u64, CacheEngine, CacheStats};
 use std::sync::Arc;
 
 /// One named cache and the policy that surrounds it.
@@ -12,8 +12,10 @@ use std::sync::Arc;
 /// structures to keep in step, and a reaper walking keys the engine has
 /// already dropped. Passing an absolute expiry down to the entry avoids all
 /// three: the engine drops what has expired, on read and on its own sweep.
+/// The keyspace does not store its own name: [`Node`](crate::Node) already
+/// keys its map by that name, so a copy here would be a second source of truth
+/// for the same string.
 pub struct Keyspace {
-    name: String,
     engine: Arc<CacheEngine>,
     /// Applied to writes that don't carry their own TTL. Milliseconds;
     /// `0` = entries never expire.
@@ -21,20 +23,11 @@ pub struct Keyspace {
 }
 
 impl Keyspace {
-    pub fn new(name: String, engine: Arc<CacheEngine>, default_ttl_secs: u64) -> Self {
+    pub fn new(engine: Arc<CacheEngine>, default_ttl_secs: u64) -> Self {
         Self {
-            name,
             engine,
             default_ttl_ms: (default_ttl_secs as u128) * 1000,
         }
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn engine(&self) -> &Arc<CacheEngine> {
-        &self.engine
     }
 
     /// Read a key. `None` means miss — either never written, or expired or
@@ -58,7 +51,13 @@ impl Keyspace {
             None => self.default_ttl_ms,
         };
         let expires_at = if ttl_ms > 0 {
-            (now_millis() + ttl_ms) as u64
+            // Saturating: a TTL far enough in the future to overflow `u64`
+            // millis is indistinguishable from "never", which is what the
+            // caller asked for.
+            (now_millis_u64() as u128)
+                .saturating_add(ttl_ms)
+                .try_into()
+                .unwrap_or(u64::MAX)
         } else {
             0
         };
@@ -78,11 +77,4 @@ impl Keyspace {
     pub fn tracked_ttl_keys(&self) -> usize {
         self.engine.tracked_ttl_keys()
     }
-}
-
-fn now_millis() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before unix epoch")
-        .as_millis()
 }
